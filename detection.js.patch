@@ -1,0 +1,23 @@
+--- detection.js.old2025-05-12 22:06:32
++++ detection.js.new2025-05-12 22:06:32
+@@ -71,7 +71,8 @@
+     }
+     // Process the image and return results
+     try {
+-      // Extract image name from URL to use as meal ID (consistent with iOS app)
++      // Extract image name from URL to use as meal ID (consistent with iOS app)      
++       
+ let mealId;
+ if (data.mealId) {
+   mealId = data.mealId;
+@@ -1346,7 +1347,11 @@
+       potassium: Math.round(150 + Math.random() * 250) // Random placeholder
+     }
+   };
++}
++    } catch (error) {
++      logger.error("Error in analyzeFoodImage:", error);
++      throw new functions.https.HttpsError('internal', 'Analysis failed', error.message);
++    }
+   }
+ );

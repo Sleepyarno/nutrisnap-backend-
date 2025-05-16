@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "default": "nutrisnap2",
+    "dev": "nutrisnap2",
+    "test": "nutrisnap2",
+    "prod": "nutrisnap2"
+  }
+}

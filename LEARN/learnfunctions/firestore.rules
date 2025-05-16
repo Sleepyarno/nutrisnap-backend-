@@ -1,0 +1,15 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Allow read access to knowledge base articles for everyone
+    match /knowledgeBaseArticles/{articleId} {
+      allow read: true;
+      allow write: false;
+    }
+    
+    // Default deny
+    match /{document=**} {
+      allow read, write: false;
+    }
+  }
+}

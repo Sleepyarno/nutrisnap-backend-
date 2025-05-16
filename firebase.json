@@ -1,0 +1,115 @@
+{
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "functions": {
+    "source": "functions",
+    "predeploy": [
+      "npm --prefix \"$RESOURCE_DIR\" run lint"
+    ],
+    "v1": {
+      "maxInstances": 10,
+      "learn_getKnowledgeArticleBySlug": {
+        "memory": "1024MiB"
+      },
+      "learn_listKnowledgeArticlesByCategory": {
+        "memory": "1024MiB"
+      },
+      "learn_listKnowledgeCategories": {
+        "memory": "1024MiB"
+      },
+      "learn_getFeaturedArticles": {
+        "memory": "1024MiB"
+      },
+      "learn_searchKnowledgeArticles": {
+        "memory": "1024MiB"
+      },
+      "learn_getLatestArticles": {
+        "memory": "1024MiB"
+      },
+      "learnV2_getKnowledgeArticleBySlug": {
+        "memory": "1024MiB"
+      },
+      "learnV2_listKnowledgeArticlesByCategory": {
+        "memory": "1024MiB"
+      },
+      "learnV2_listKnowledgeCategories": {
+        "memory": "1024MiB"
+      },
+      "learnV2_getFeaturedArticles": {
+        "memory": "1024MiB"
+      },
+      "learnV2_searchKnowledgeArticles": {
+        "memory": "1024MiB"
+      },
+      "learnV2_getLatestArticles": {
+        "memory": "1024MiB"
+      }
+    },
+    "v2": {
+      "app": {
+        "memory": "512MiB"
+      },
+      "getFoodScanResult": {
+        "memory": "512MiB"
+      },
+      "fatsecretApi": {
+        "memory": "512MiB"
+      },
+      "getUploadUrl": {
+        "memory": "512MiB"
+      },
+      "processUploadedImage": {
+        "memory": "512MiB"
+      },
+      "analyzeFoodImage": {
+        "memory": "512MiB"
+      },
+      "getGlucoseCurve": {
+        "memory": "512MiB"
+      },
+      "recognizeFoodFromImage": {
+        "memory": "512MiB"
+      },
+      "searchFatSecretNutrition": {
+        "memory": "512MiB"
+      },
+      "getFatSecretFoodDetails": {
+        "memory": "512MiB"
+      }
+    }
+  },
+  "storage": {
+    "rules": "storage.rules"
+  },
+  "emulators": {
+    "auth": {
+      "port": 9099
+    },
+    "functions": {
+      "port": 5001
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "storage": {
+      "port": 9199
+    },
+    "ui": {
+      "enabled": true
+    }
+  },
+  "hosting": {
+    "public": "functions/src/FRONT-END/nutrisnaps/dist",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      { "source": "/api/**", "function": "app" },
+      { "source": "**", "destination": "/index.html" }
+    ]
+  }
+}

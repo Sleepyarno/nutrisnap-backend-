@@ -1,0 +1,1302 @@
+/* eslint-env node */
+// NutriSnap backend now uses both Open Food Facts and USDA FoodData Central API for nutrition data.
+//
+// USDA API KEY MANAGEMENT:
+// - For local development, use a . with USDA_API_KEY=your_key and ensure dotenv is loaded.
+// - For production (Firebase Cloud Functions), use: firebase functions:config:set usda.api_key="your_key"
+//   The code will automatically use the right key for each environment.
+
+// Load .env for local dev
+try { require('dotenv').config(); } catch (e) { /* ignore if dotenv not installed */ }
+
+const { HttpsError } = require('firebase-functions/v2/https');
+const admin = require('firebase-admin');
+const vision = require('@google-cloud/vision');
+const { Timestamp } = require('firebase-admin/firestore');
+const logger = require("firebase-functions/logger"); // Import the logger
+const { enhanceFoodDetection } = require('./llmEnhancer'); // Import LLM enhancer
+const apiUtils = require('../utils/apiUtils'); // Import API utilities
+const fatSecretAPI = require('../utils/fatSecretAPI'); // Import FatSecret API utilities
+
+// Initialize Vision API client with default credentials
+
+
+let visionClient = null;
+
+
+async function getVisionClient() {
+  if (!visionClient) {
+    try {
+      // Initialize the Vision client using default credentials
+      visionClient = new vision.ImageAnnotatorClient();
+      logger.info('Vision API client initialized successfully using default credentials.');
+    } catch (error) {
+      // Log the detailed error if initialization fails
+      logger.error('Failed to initialize Vision API client with default credentials:', error);
+      // Re-throw the error to ensure the main function logic catches it
+      throw error;
+    }
+  }
+  return visionClient;
+}
+
+// Analyze food image
+const { onCall } = require("firebase-functions/v2/https");
+
+// Helper functions
+
+async function getNutritionFromOFF(foodLabel) {
+        if (!foodLabel) return null;
+        
+        // No mock data - only use real API data
+        
+        const searchLabel = encodeURIComponent(foodLabel.trim());
+        const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${searchLabel}&search_simple=1&action=process&json=1&page_size=1`;
+        
+        // Generate cache key from the API URL
+        const cacheKey = `off_${searchLabel}`;
+        
+        // Check if we have a cached response
+        const cachedData = apiUtils.getCachedResponse(cacheKey);
+        if (cachedData) {
+          logger.info(`Using cached Open Food Facts data for: ${foodLabel}`);
+          return cachedData;
+        }
+        
+        // Check if we're allowed to make a request (rate limiting)
+        if (!apiUtils.isRequestAllowed('openfoodfacts')) {
+          logger.warn(`Rate limited: Skipping Open Food Facts request for ${foodLabel}`);
+          logger.info(`No nutritional data available for ${foodLabel} due to rate limiting`);
+          return null;
+        }
+
+async function getNutritionFromUSDA(foodLabel) {
+        if (!foodLabel) return null;
+        
+        // Define apiKey in the wider scope so it's available throughout the function
+        let apiKey;
+        
+        try {
+          // For Cloud Functions v2, config values are available directly in process.env
+          apiKey = process.env.USDA_API_KEY;
+          
+          // Legacy config approach as fallback
+          if (!apiKey && process.env.FIREBASE_CONFIG) {
+            const config = JSON.parse(process.env.FIREBASE_CONFIG);
+            apiKey = config.usda?.api_key;
+          }
+          
+          if (!apiKey) {
+            logger.warn('USDA_API_KEY not set in environment. Skipping USDA lookup.');
+            return null;
+          }
+
+function getReferenceNutritionData(detectedIngredients, labels) {
+  try {
+    const foodLabels = labels ? labels.map(l => l.toLowerCase()) : [];
+    
+    // Detect meal type from labels
+    const isBreakfast = foodLabels.some(l => l.includes('breakfast') || l.includes('brunch'));
+    const isEnglishBreakfast = foodLabels.some(l => l.includes('full breakfast') || l.includes('english breakfast'));
+    
+    // Initialize ingredient data
+    let ingredients = [];
+    let totalNutrition = {
+      calories: 0,
+      protein: 0,
+      fat: 0,
+      carbohydrates: 0,
+      fiber: 0
+    };
+    
+    // Check for English breakfast components based on vision detection
+    if (isEnglishBreakfast) {
+      const components = [];
+      
+      // Look for eggs
+      if (foodLabels.some(l => l.includes('egg') || l.includes('fried egg'))) {
+        components.push({
+          name: 'fried egg',
+          quantity: 1,
+          macros: { calories: 90, protein: 6.3, fat: 7, carbohydrates: 0.4, fiber: 0 }
+        });
+      }
+      
+      // Look for sausage
+      if (foodLabels.some(l => l.includes('sausage'))) {
+        components.push({
+          name: 'breakfast sausage link',
+          quantity: 1,
+          macros: { calories: 100, protein: 5.8, fat: 8.2, carbohydrates: 0.8, fiber: 0 }
+        });
+      }
+      
+      // Look for bacon
+      if (foodLabels.some(l => l.includes('bacon'))) {
+        components.push({
+          name: 'bacon strip',
+          quantity: 2,
+          macros: { calories: 86, protein: 6, fat: 6.8, carbohydrates: 0.1, fiber: 0 }
+        });
+      }
+      
+      // Add other common breakfast components if detected
+      if (foodLabels.some(l => l.includes('toast') || l.includes('bread'))) {
+        components.push({
+          name: 'toast slice',
+          quantity: 1,
+          macros: { calories: 75, protein: 3, fat: 1, carbohydrates: 13.5, fiber: 1 }
+        });
+      }
+      
+      if (foodLabels.some(l => l.includes('bean') || l.includes('baked beans'))) {
+        components.push({
+          name: 'baked beans',
+          quantity: 0.5, // Cup
+          macros: { calories: 119, protein: 6.9, fat: 0.5, carbohydrates: 23.8, fiber: 5.2 }
+        });
+      }
+      
+      // If components were found, calculate accurate totals
+      if (components.length > 0) {
+        // Convert components to ingredients with proper structure
+        components.forEach(comp => {
+          // Add to total nutrition
+          Object.keys(comp.macros).forEach(key => {
+            if (totalNutrition[key] !== undefined) {
+              totalNutrition[key] += comp.macros[key] * comp.quantity;
+            }
+          });
+          
+          // Format as ingredient
+          ingredients.push({
+            name: comp.quantity > 1 ? `${comp.quantity} ${comp.name}s` : comp.name,
+            sources: ['REFERENCE_DATABASE'],
+            macros: {
+              calories: { value: comp.macros.calories, source: 'REFERENCE_DATABASE' },
+              protein: { value: comp.macros.protein, source: 'REFERENCE_DATABASE' },
+              fat: { value: comp.macros.fat, source: 'REFERENCE_DATABASE' },
+              carbohydrates: { value: comp.macros.carbohydrates, source: 'REFERENCE_DATABASE' }
+            },
+            micros: {},
+            message: 'Based on nutritional reference data'
+          });
+        });
+        
+        // Round values to reasonable precision
+        Object.keys(totalNutrition).forEach(key => {
+          totalNutrition[key] = Math.round(totalNutrition[key] * 10) / 10;
+        });
+        
+        return {
+          ingredients,
+          totals: totalNutrition
+        };
+      }
+    }
+    
+    // Similar logic for other meal types can be added here
+    
+    // If no specific meal type matched, return null
+    return null;
+  }
+
+function calculateNutritionFromIngredients(detectedIngredients, labels) {
+  try {
+    // Start with empty nutrition values
+    const totalNutrition = {
+      calories: 0,
+      protein: 0,
+      fat: 0,
+      carbohydrates: 0,
+      fiber: 0
+    };
+    
+    // If no detected ingredients, try to extract from labels
+    if (!detectedIngredients || detectedIngredients.length === 0) {
+      // Process food labels to identify ingredients
+      const foodLabels = labels ? labels.filter(l => 
+        !l.toLowerCase().includes('breakfast') && 
+        !l.toLowerCase().includes('meal') &&
+        !l.toLowerCase().includes('food')
+      ) : [];
+      
+      // If we have some food labels, use standard nutritional values
+      if (foodLabels.length > 0) {
+        const standardValues = {
+          // Common protein sources
+          'egg': { calories: 78, protein: 6.3, fat: 5.3, carbohydrates: 0.6, fiber: 0 },
+          'sausage': { calories: 230, protein: 11, fat: 20, carbohydrates: 1.5, fiber: 0 },
+          'bacon': { calories: 43, protein: 3, fat: 3.4, carbohydrates: 0.1, fiber: 0 },
+          'meat': { calories: 200, protein: 22, fat: 13, carbohydrates: 0, fiber: 0 },
+          'chicken': { calories: 165, protein: 31, fat: 3.6, carbohydrates: 0, fiber: 0 },
+          'fish': { calories: 136, protein: 22, fat: 5, carbohydrates: 0, fiber: 0 },
+          'beef': { calories: 250, protein: 26, fat: 17, carbohydrates: 0, fiber: 0 },
+          
+          // Common carbohydrate sources
+          'toast': { calories: 75, protein: 3, fat: 1, carbohydrates: 13.5, fiber: 1 },
+          'bread': { calories: 75, protein: 3, fat: 1, carbohydrates: 13.5, fiber: 1 },
+          'beans': { calories: 240, protein: 14, fat: 1, carbohydrates: 48, fiber: 10.4 },
+          'rice': { calories: 204, protein: 4.3, fat: 0.4, carbohydrates: 44.5, fiber: 0.6 },
+          'potato': { calories: 161, protein: 4.3, fat: 0.2, carbohydrates: 36.6, fiber: 3.8 },
+          'pasta': { calories: 182, protein: 6.7, fat: 1.5, carbohydrates: 35.5, fiber: 2.5 },
+          
+          // Fruits and vegetables
+          'apple': { calories: 95, protein: 0.5, carbs: 25, fat: 0.3, fiber: 4.4 },
+          'banana': { calories: 105, protein: 1.3, carbs: 27, fat: 0.3, fiber: 3.1 },
+          'broccoli': { calories: 55, protein: 3.7, carbs: 11.2, fat: 0.6, fiber: 5.1 },
+          'carrot': { calories: 41, protein: 0.9, carbs: 9.6, fat: 0.2, fiber: 2.8 },
+          'tomato': { calories: 18, protein: 0.9, carbs: 3.9, fat: 0.2, fiber: 1.2 },
+          'lettuce': { calories: 15, protein: 1.4, carbs: 2.9, fat: 0.2, fiber: 1.3 },
+          'avocado': { calories: 160, protein: 2, carbs: 8.5, fat: 14.7, fiber: 6.7 },
+          
+          // Dairy
+          'milk': { calories: 103, protein: 8, fat: 2.4, carbohydrates: 12, fiber: 0 },
+          'cheese': { calories: 113, protein: 7, fat: 9, carbohydrates: 0.4, fiber: 0 },
+          'yogurt': { calories: 150, protein: 5, fat: 8, carbohydrates: 12, fiber: 0 },
+          
+          // Sweets
+          'ice cream': { calories: 207, protein: 3.5, fat: 11, carbohydrates: 24, fiber: 0.7 },
+          'cake': { calories: 260, protein: 3, fat: 12, carbohydrates: 38, fiber: 0.8 },
+          'chocolate': { calories: 155, protein: 2, fat: 9, carbohydrates: 17, fiber: 2 }
+        };
+        
+        // Format ingredients and calculate totals
+        const ingredients = [];
+        foodLabels.forEach(label => {
+          const term = label.toLowerCase();
+          // Find matching standard ingredient
+          const matchedIngredient = Object.keys(standardValues).find(key => term.includes(key));
+          
+          if (matchedIngredient) {
+            const macros = standardValues[matchedIngredient];
+            
+            // Add to total nutrition
+            Object.keys(macros).forEach(key => {
+              if (totalNutrition[key] !== undefined) {
+                totalNutrition[key] += macros[key];
+              }
+            });
+            
+            // Add ingredient to list
+            ingredients.push({
+              name: label,
+              sources: ['CALCULATED'],
+              macros: {
+                calories: { value: macros.calories, source: 'CALCULATED' },
+                protein: { value: macros.protein, source: 'CALCULATED' },
+                fat: { value: macros.fat, source: 'CALCULATED' },
+                carbohydrates: { value: macros.carbohydrates, source: 'CALCULATED' }
+              },
+              micros: {},
+              message: 'Based on standard nutritional data'
+            });
+          }
+        });
+        
+        if (ingredients.length > 0) {
+          // Round values for presentation
+          Object.keys(totalNutrition).forEach(key => {
+            totalNutrition[key] = Math.round(totalNutrition[key]);
+          });
+          
+          return {
+            ingredients,
+            totals: totalNutrition
+          };
+        }
+
+async function getNutritionData(foodItems) {
+
+// --- Cloud Run HTTP server compatibility ---
+if (require.main === module) {
+  const express = require('express');
+  const cors = require('cors');
+  const app = express();
+  app.use(cors());
+  app.use(express.json());
+
+  // Example health check route
+  app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok' });
+  });
+
+  // Mount your main handler (adjust as needed)
+  // Example: app.post('/getFoodScanResult', yourHandlerFunction)
+
+  const port = process.env.PORT || 8080;
+  app.listen(port, () => {
+    console.log(`Server listening on port ${port}`);
+  });
+}
+
+  // --- Placeholder logic ---
+  let calories = 0, protein = 0, carbs = 0, fat = 0, fiber = 0, sugar = 0;
+  const nutritionMap = { // Simplified map for demo
+    'apple': { calories: 95, protein: 0.5, carbs: 25, fat: 0.3, fiber: 4.4, sugar: 19 },
+    'banana': { calories: 105, protein: 1.3, carbs: 27, fat: 0.3, fiber: 3.1, sugar: 14 },
+    'chicken breast': { calories: 165, protein: 31, carbs: 0, fat: 3.6, fiber: 0, sugar: 0 },
+    'rice': { calories: 130, protein: 2.7, carbs: 28, fat: 0.3, fiber: 0.4, sugar: 0.1 },
+    'broccoli': { calories: 55, protein: 3.7, carbs: 11.2, fat: 0.6, fiber: 5.1, sugar: 1.5 },
+    'salad': { calories: 152, protein: 1.2, carbs: 6, fat: 15, fiber: 1.5, sugar: 1.5 },
+    'pizza slice': { calories: 285, protein: 12, carbs: 36, fat: 10, fiber: 2.5, sugar: 3.8 },
+    // Add more representative foods
+  };
+
+  if (foodItems.length === 0) {
+    logger.warn("No food items detected to calculate nutrition.");
+    // Return zero or default values if no food items were passed
+    return { calories: 0, protein: 0, carbs: 0, fat: 0, microNutrients: { fiber: 0, sugar: 0, sodium: 0, potassium: 0 } };
+  }
+
+// Main handler function
+async function analyzeFoodImageHandler(request) {
+    console.log("analyzeFoodImage function called");
+
+    // Destructure data and auth from request (2nd-gen signature)
+    const { data, auth } = request;
+    console.log("Auth present:", !!auth);
+    console.log("Data contains image URL:", !!data?.imageUrl);
+
+    // Enforce authentication via Firebase Auth
+    if (!auth) {
+      console.error("No authentication provided to analyzeFoodImage");
+      throw new HttpsError(
+        'unauthenticated',
+        'The function must be called while authenticated.'
+      );
+    }
+    console.log("User is authenticated via Firebase Auth:", auth.uid);
+
+    // The image URL is required
+    const imageUrl = data.imageUrl;
+    if (!imageUrl) {
+      throw new HttpsError(
+        'invalid-argument',
+        'Missing image URL'
+      );
+    }
+    // Process the image and return results
+    try {
+      // Extract image name from URL to use as meal ID (consistent with iOS app)
+let mealId;
+if (data.mealId) {
+  mealId = data.mealId;
+} else {
+  // Try to extract the image name from the URL which is typically a UUID
+  // Extract filename from Firebase Storage URL
+  const storageUrlPattern = /images%2F([\w-]+)\.(jpg|jpeg|png)/i;
+  const match = imageUrl.match(storageUrlPattern);
+  
+  if (match && match[1]) {
+    // Use the image filename without extension as mealId
+    mealId = match[1];
+    logger.info(`Extracted image filename as mealId: ${mealId}`);
+  } else {
+    // Fallback to Firestore generated ID
+    mealId = admin.firestore().collection('meals').doc().id;
+    logger.info(`Generated Firestore ID for mealId: ${mealId}`);
+  }
+}
+      logger.info("Starting real image analysis for imageUrl: " + imageUrl, { userId: auth.uid, mealId });
+      const visionClient = await getVisionClient();
+      // Download image as buffer
+      const fetch = require('node-fetch'); // Used for both OFF and USDA requests
+      const response = await fetch(imageUrl);
+      if (!response.ok) {
+        throw new HttpsError('invalid-argument', 'Unable to download image from provided URL.');
+      }
+      const imageBuffer = await response.buffer();
+
+      // Run Vision API with both LABEL_DETECTION and OBJECT_LOCALIZATION
+      const [visionResponse] = await visionClient.annotateImage({
+        image: { content: imageBuffer },
+        features: [
+          { type: 'LABEL_DETECTION', maxResults: 15 },
+          { type: 'OBJECT_LOCALIZATION', maxResults: 10 },
+          // Add PRODUCT_SEARCH or TEXT_DETECTION here if needed
+        ],
+      });
+      const visionLabels = visionResponse.labelAnnotations || [];
+logger.info('Raw Vision API labelAnnotations:', JSON.stringify(visionLabels, null, 2));
+      const localizedObjects = visionResponse.localizedObjectAnnotations || [];
+logger.info('Raw Vision API localizedObjectAnnotations:', JSON.stringify(localizedObjects, null, 2));
+      logger.info('Vision API labels:', visionLabels.map(l => l.description));
+      logger.info('Vision API object localizations:', localizedObjects.map(o => `${o.name} (${o.score})`));
+
+      // Function to check if a label describes a food item
+      function isFoodItem(description) {
+        const foodKeywords = [
+          // General food terms
+          'food', 'meal', 'breakfast', 'lunch', 'dinner', 'snack', 'dish',
+          'cuisine', 'plate', 'bowl', 'dining',
+          
+          // Food categories
+          'fruit', 'vegetable', 'meat', 'fish', 'grain', 'cereal', 'nut', 'seed',
+          'pasta', 'salad', 'soup', 'sandwich', 'burger', 'pizza', 'beverage',
+          'drink', 'ingredient', 'dairy', 'cheese', 'egg', 'eggs', 'poultry', 'seafood',
+          
+          // Breakfast specific items
+          'bacon', 'sausage', 'sausages', 'beans', 'baked beans', 'toast', 'mushroom', 'mushrooms',
+          'tomato', 'tomatoes', 'hash brown', 'hash browns', 'black pudding', 'full english', 'english breakfast',
+          'ham', 'bread', 'potato', 'potatoes',
+          
+          // Common food preparations
+          'fried', 'grilled', 'baked', 'boiled', 'scrambled', 'sunny side up', 'over easy',
+          'roasted', 'steamed', 'poached', 'barbecued', 'stewed', 'toasted',
+          
+          // Common ingredients
+          'butter', 'oil', 'sauce', 'mayonnaise', 'ketchup', 'syrup', 'jam', 'spread',
+          'sugar', 'salt', 'pepper', 'spice', 'herb'
+        ];
+        
+        // Check if the description contains any of the keywords
+        return foodKeywords.some(keyword => description.includes(keyword));
+      }
+
+      // Check for barcode object
+      const barcodeObj = localizedObjects.find(obj =>
+        obj.name.toLowerCase().includes('barcode') && obj.score > 0.65
+      );
+      const barcodeDetected = !!barcodeObj;
+      logger.info('Barcode detected:', barcodeDetected);
+
+      // Extract just the description strings
+      const labelDescriptions = visionLabels.map(l => l.description);
+logger.info('labelDescriptions:', labelDescriptions);
+
+      // Filter labels for food items
+      const foodLabels = labelDescriptions.filter(l => isFoodItem(l.toLowerCase()));
+logger.info("Filtered food labels:", foodLabels);
+
+      // Decision Logic
+      // A. Plated meal detected (multiple food labels, no barcode or ignore barcode in meal context)
+      if (foodLabels.length > 0 && (!barcodeDetected || !labelDescriptions.some(l => l.toLowerCase().includes('packaged')))) {
+        logger.info('Scenario A: Plated meal or food detected, aggregating all nutrition data from USDA (no OFF).');
+        try {
+          // Set up a non-food label filter for better accuracy
+          const nonFoodLabels = new Set([
+            'food', 'cuisine', 'dish', 'recipe', 'meal', 'lunch', 'dinner', 'breakfast', 'brunch',
+            'ingredient', 'produce', 'vegetables', 'snack', 'cooking', 'dessert', 'baking', 'plate', 'bowl'
+          ]);
+          let filteredFoodLabels = foodLabels
+            .filter(label => !nonFoodLabels.has(label));
+          logger.info('Labels considered for nutrition lookup:', filteredFoodLabels);
+          let ingredients = [];
+          let totals = {calories: 0, protein: 0, fat: 0, carbohydrates: 0};
+          let anyFound = false;
+          // Process only the most relevant food labels (limit to 6) to avoid timeouts
+          // Process only the most relevant food labels (limit to 6) to avoid timeouts
+          const priorityFoodLabels = filteredFoodLabels
+            .filter(label => {
+              // Prioritize specific food items over generic terms
+              return !['food', 'ingredient', 'breakfast', 'dish', 'meal', 'cooking', 'brunch'].includes(label.toLowerCase());
+            })
+            .slice(0, 6); // Increased: process up to 6 specific food items to avoid missing components
+          logger.info('Priority food labels for nutrition lookup:', priorityFoodLabels);
+          // Log before nutrition lookup
+          logger.info('Filtered food labels before nutrition lookup:', filteredFoodLabels);
+        
+        // Use Promise.all to fetch nutrition data in parallel rather than sequentially
+        const nutritionResults = await Promise.all(
+          priorityFoodLabels.map(async (label) => {
+            try {
+              // Set timeouts for API calls to avoid hanging
+              const usdaPromise = getNutritionFromUSDA(label).catch(err => {
+                logger.warn(`USDA nutrition lookup failed for '${label}':`, err);
+                return null;
+              });
+              
+              const offPromise = getNutritionFromOFF(label).catch(err => {
+                logger.warn(`OFF nutrition lookup failed for '${label}':`, err);
+                return null;
+              });
+              
+              const fatSecretPromise = fatSecretAPI.getNutritionFromFatSecret(label).catch(err => {
+                logger.warn(`FatSecret nutrition lookup failed for '${label}':`, err);
+                return null;
+              });
+              
+              // Create a timeout promise
+              const timeout = new Promise((resolve) => setTimeout(() => {
+                logger.warn(`Timeout exceeded for nutrition lookup of '${label}'`);
+                resolve({ usdaNutrition: null, offNutrition: null, fatSecretNutrition: null });
+              }, 5000));
+              
+              // Race against timeout
+              const [usdaNutrition, offNutrition, fatSecretNutrition] = await Promise.race([
+                Promise.all([usdaPromise, offPromise, fatSecretPromise]),
+                timeout.then(() => [null, null, null])
+              ]);
+              
+              logger.info(`USDA nutrition for '${label}':`, usdaNutrition);
+              logger.info(`OFF nutrition for '${label}':`, offNutrition);
+              logger.info(`FatSecret nutrition for '${label}':`, fatSecretNutrition);
+              
+              return { label, usdaNutrition, offNutrition, fatSecretNutrition };
+            } catch (error) {
+              logger.error(`Error fetching nutrition for '${label}':`, error);
+              return { label, usdaNutrition: null, offNutrition: null, fatSecretNutrition: null };
+            }
+          })
+        );
+        
+        // Use reference data if API lookup fails
+        if (nutritionResults.every(result => !result.usdaNutrition && !result.offNutrition)) {
+          logger.info('No nutrition data found via APIs. Using reference database for accurate values.');
+          
+          // Try the reference database
+          const referenceData = getReferenceNutritionData([], filteredFoodLabels);
+          
+          if (referenceData && referenceData.ingredients.length > 0) {
+            logger.info('Successfully found reference nutritional data');
+            ingredients = referenceData.ingredients;
+            totals = referenceData.totals;
+            anyFound = true;
+            
+            // Skip normal processing by setting an empty array to process
+            nutritionResults.length = 0;
+          } else {
+            // If reference database also fails, try ingredient-based calculation
+            logger.info('No reference data found. Attempting ingredient-based calculation...');
+            const calculatedData = calculateNutritionFromIngredients([], filteredFoodLabels);
+            
+            if (calculatedData) {
+              logger.info('Successfully calculated nutrition from ingredients');
+              ingredients = calculatedData.ingredients;
+              totals = calculatedData.totals;
+              anyFound = true;
+              
+              // Skip normal processing by setting an empty array to process
+              nutritionResults.length = 0;
+            }
+          }
+        }
+
+        // Process each individual nutrition result
+        for (const result of nutritionResults) {
+          const { label, usdaNutrition, offNutrition, fatSecretNutrition } = result;
+          
+          // Track sources
+          const sources = [];
+          if (usdaNutrition) sources.push('USDA');
+          if (offNutrition) sources.push('OFF');
+          if (fatSecretNutrition) sources.push('FatSecret');
+
+          if (usdaNutrition || offNutrition || fatSecretNutrition) {
+            // Prefer most specific name: OFF > FatSecret > USDA > label
+            let ingredientName = offNutrition?.foodName || fatSecretNutrition?.foodName || usdaNutrition?.foodName || label;
+            // Compose user message for partial data
+            let message = null;
+            if (!usdaNutrition && !offNutrition && !fatSecretNutrition) {
+              message = 'No nutrition data found for this item.';
+            } else {
+              // Determine which sources we have
+              const availableSources = [];
+              if (usdaNutrition) availableSources.push('USDA');
+              if (offNutrition) availableSources.push('OFF');
+              if (fatSecretNutrition) availableSources.push('FatSecret');
+              
+              if (availableSources.length === 1) {
+                message = `Nutrition data found from only one source (${availableSources[0]}).`;
+              } else {
+                // Check for missing macros/micros
+                const missingMacros = macroKeys.filter(k => macros[k].value === 0);
+                if (missingMacros.length > 0) {
+                  message = `Partial nutrition data: missing ${missingMacros.join(', ')}.`;
+                }
+              }
+            }
+            ingredients.push({
+              name: ingredientName,
+              sources,
+              macros,
+              micros,
+              ...(message ? { message } : {})
+            });
+            // Sum totals using .value fields (always numbers)
+            totals.calories += Number(macros.calories.value);
+            totals.protein += Number(macros.protein.value);
+            totals.fat += Number(macros.fat.value);
+            totals.carbohydrates += Number(macros.carbohydrates.value);
+            anyFound = true;
+          } else {
+            ingredients.push({
+              name: label,
+              sources: [],
+              macros: {},
+              micros: {},
+              message: 'No nutrition data found for this item.'
+            });
+          }
+        }
+        logger.info('Merged ingredient results (pre-LLM):', ingredients);
+logger.info('Final ingredients array before return:', ingredients);
+        logger.info('Computed totals:', totals);
+        // Create a more descriptive meal name
+        let mealName;
+        // Attempt meal classification with original and expanded labels
+        let expandedFoodLabels = [...filteredFoodLabels];
+        
+        // Add inferred breakfast-related labels if breakfast indicators are present
+        const breakfastIndicators = ['morning', 'breakfast', 'brunch', 'dawn', 'am', 'early', 'meal', 'plate', 'dish'];
+        const hasBreakfastIndicator = filteredFoodLabels.some(label => 
+          breakfastIndicators.some(indicator => label.includes(indicator))
+        );
+        
+        // Add 'english breakfast' label if breakfast indicators and typical items are present
+        const englishBreakfastItems = ['egg', 'eggs', 'sausage', 'sausages', 'bacon', 'ham', 'bean', 'beans', 'mushroom', 'mushrooms', 'tomato', 'tomatoes', 'toast', 'bread', 'hash brown', 'hash browns', 'potato'];
+        const hasEnglishBreakfastItems = ingredientNames => 
+          englishBreakfastItems.filter(item => 
+            ingredientNames.some(name => name.includes(item) || (name.includes('fried') && item === 'egg'))
+          ).length >= 1; // Lower threshold to 1 to better detect English breakfast components
+        
+        if (hasBreakfastIndicator || hasEnglishBreakfastItems(ingredients.map(i => i.name.toLowerCase()))) {
+          expandedFoodLabels.push('breakfast');
+          logger.info('Added breakfast label based on food context');
+          
+          // If multiple English breakfast items detected, add 'english breakfast' label
+          if (hasEnglishBreakfastItems(ingredients.map(i => i.name.toLowerCase()))) {
+            expandedFoodLabels.push('english breakfast');
+            logger.info('Added english breakfast label based on typical ingredients');
+          }
+        }
+        
+        if (foodLabels.length > 0) {
+          // Try to classify the meal with expanded labels
+          mealName = classifyMeal(ingredients, expandedFoodLabels);
+          
+          if (!mealName) {
+            // If classification failed, create a name from top ingredients
+            const topIngredients = ingredients
+              .filter(i => i.name) // Ensure the ingredient has a name
+              .slice(0, 2) // Take top 2
+              .map(i => i.name.charAt(0).toUpperCase() + i.name.slice(1)) // Capitalize
+              .join(' and '); // Join with 'and'
+            mealName = topIngredients ? `${topIngredients} Dish` : 'Mixed Meal';
+          }
+        } else if (foodLabels.length === 1) {
+          // Single item - use its name
+          mealName = foodLabels[0].charAt(0).toUpperCase() + foodLabels[0].slice(1);
+        } else {
+          // Fallback
+          mealName = 'Food Item';
+        }  
+        let messages = [];
+        if (!anyFound) {
+          logger.warn('No nutrition data found via USDA or OFF. Using reference database for accurate values.');
+          messages.push('Using reference nutritional database values.');
+          
+          // Look up accurate reference data based on detected ingredients
+          const referenceData = getReferenceNutritionData(detectedIngredients, labels);
+          
+          if (referenceData && referenceData.ingredients.length > 0) {
+            // Use reference data if available
+            ingredients = referenceData.ingredients;
+            totals = referenceData.totals;
+            anyFound = true;
+            logger.info(`Found reference nutrition data with ${ingredients.length} ingredients`);
+          } else {
+            // Calculate based on detected ingredients if no reference data
+            logger.info('No reference data found. Calculating from individual ingredients');
+            
+            // Calculate based on detected ingredients with component-based approach
+            const calculatedData = calculateNutritionFromIngredients(detectedIngredients, labels);
+            
+            if (calculatedData) {
+              ingredients = calculatedData.ingredients;
+              totals = calculatedData.totals;
+              anyFound = true;
+              messages.push('Nutrition calculated from ingredient components.');
+            } else {
+              // If all else fails, leave empty but don't use mock data
+              logger.warn('Unable to calculate nutrition data from ingredients');
+              messages.push('Insufficient nutrition data available for this meal.');
+              totals = {};
+              ingredients = [];
+            }
+          }
+        } else {
+          // Convert totals to simple numbers for iOS app compatibility
+          totals = {
+            calories: Number(totals.calories),
+            protein: Number(totals.protein),
+            fat: Number(totals.fat),
+            carbohydrates: Number(totals.carbohydrates)
+          };
+        }
+        // Enhance results with LLM if enabled via environment variable
+        // Check all possible ways the environment variable could be set
+        const ENABLE_LLM = process.env.ENABLE_LLM_ENHANCEMENT === 'true' || 
+                         process.env.app?.enable_llm_enhancement === 'true' ||
+                         (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test');
+        
+        logger.info(`LLM enhancement is ${ENABLE_LLM ? 'enabled' : 'disabled'}`);
+        logger.info('Meal name prior to enhancement:', mealName);
+        if (mealName === 'English Breakfast') {
+          logger.info('English Breakfast would have triggered override (but override is now disabled, merging detected components instead).');
+        }
+        
+        if (ENABLE_LLM) {
+          try {
+            logger.info('Enhancing food detection results with LLM');
+            const enhancedResults = await enhanceFoodDetection(
+              ingredients,
+              mealName,
+              filteredFoodLabels
+            );
+            
+            // Update with enhanced data
+            if (enhancedResults) {
+              logger.info('Successfully enhanced food detection with LLM');
+              // For all meals, merge detected ingredients with LLM-enhanced ones, without hardcoded override
+              let mergedIngredients = ingredients;
+              if (enhancedResults.ingredients && Array.isArray(enhancedResults.ingredients)) {
+                // Merge, preferring LLM-enhanced if not already present
+                const detectedNames = new Set(ingredients.map(i => i.name.toLowerCase()));
+                mergedIngredients = [
+                  ...ingredients,
+                  ...enhancedResults.ingredients.filter(i => !detectedNames.has(i.name.toLowerCase()))
+                ];
+              }
+              // If English Breakfast, add a note
+              if (mealName === 'English Breakfast') {
+                logger.info('English Breakfast detected: merging detected and LLM-enhanced components, not overriding.');
+                // Optionally, add a message to the analysisNotes
+                if (!enhancedResults.analysisNotes) enhancedResults.analysisNotes = [];
+                enhancedResults.analysisNotes.push('Typical English Breakfast detected. Components merged from detection and LLM.');
+              }
+              ingredients = mergedIngredients;
+              
+              // Save meal data to Firestore for glucose curve function
+              try {
+                await admin.firestore().collection('meals').doc(mealId).set({
+                  userId: auth.uid,
+                  mealName,
+                  ingredients,
+                  nutrition: {
+                    carbohydrates: { value: typeof totals.carbohydrates === 'object' ? Number(totals.carbohydrates.value) : Number(totals.carbohydrates) },
+                    protein: { value: typeof totals.protein === 'object' ? Number(totals.protein.value) : Number(totals.protein) },
+                    fat: { value: typeof totals.fat === 'object' ? Number(totals.fat.value) : Number(totals.fat) },
+                    fiber: { value: 0 } // Default to 0 if not available
+                  },
+                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                  imageUrl: imageUrl
+                });
+                logger.info(`Saved meal data to Firestore with ID: ${mealId}`);
+              } catch (error) {
+                logger.error(`Error saving meal data to Firestore: ${error.message}`);
+                // Continue processing even if save fails
+              }
+              
+              // Include description, nutrition notes, and missing items if available
+              const responseObj = {
+                success: true,
+                mealId, // Include the mealId in the response for the glucose curve
+                mealName,
+                ingredients,
+                // Ensure totals are direct numeric values for iOS compatibility
+                totals: {
+                  calories: typeof totals.calories === 'object' ? Number(totals.calories.value) : Number(totals.calories),
+                  protein: typeof totals.protein === 'object' ? Number(totals.protein.value) : Number(totals.protein),
+                  fat: typeof totals.fat === 'object' ? Number(totals.fat.value) : Number(totals.fat),
+                  carbohydrates: typeof totals.carbohydrates === 'object' ? Number(totals.carbohydrates.value) : Number(totals.carbohydrates)
+                },
+                labels: filteredFoodLabels,
+                barcodes: [],
+                messages,
+                description: enhancedResults.description || null,
+                nutritionNotes: enhancedResults.nutritionNotes || null,
+                missingItems: enhancedResults.missingItems || [],
+                analysisNotes: []
+              };
+              
+              // Add detailed analysis notes if we have missing items
+              if (enhancedResults.missingItems && enhancedResults.missingItems.length > 0) {
+                responseObj.analysisNotes.push(`This ${mealName} is missing: ${enhancedResults.missingItems.join(', ')}.`);
+              }
+              
+              // Add quantity information to ingredient names if provided
+              responseObj.ingredients = responseObj.ingredients.map(ingredient => {
+                // Look for quantity information in the verifiedIngredients
+                if (enhancedResults.verifiedIngredients) {
+                  const matchingIngredientWithQuantity = enhancedResults.verifiedIngredients.find(item => {
+                    // Remove quantity in parentheses for matching
+                    const itemName = item.replace(/\s+\([^)]+\)$/, '');
+                    return itemName.toLowerCase() === ingredient.name.toLowerCase();
+                  });
+                  
+                  if (matchingIngredientWithQuantity) {
+                    // Extract quantity if present
+                    const quantityMatch = matchingIngredientWithQuantity.match(/\(([^)]+)\)$/);
+                    if (quantityMatch) {
+                      // Add quantity info to the ingredient object
+                      return {
+                        ...ingredient,
+                        quantity: quantityMatch[1],
+                        displayName: `${ingredient.name} (${quantityMatch[1]})`
+                      };
+                    }
+                  }
+                }
+                return ingredient;
+              });
+              
+              logger.info('Merged ingredient results (post-LLM):', responseObj.ingredients);
+              logger.info('Returning LLM-enhanced response');
+              return responseObj;
+            }
+          } catch (error) {
+            // Log error but continue with original results
+            logger.error('Error enhancing food detection with LLM:', error);
+            logger.info('Continuing with unenhanced results');
+          }
+        // End of try-catch for LLM enhancement
+        
+        // Return original results if LLM enhancement is disabled or failed
+        const responseObj = {
+          success: true,
+          mealName,
+          ingredients,
+          // Ensure totals are direct numeric values for iOS compatibility
+          totals: {
+            calories: typeof totals.calories === 'object' ? Number(totals.calories.value) : Number(totals.calories),
+            protein: typeof totals.protein === 'object' ? Number(totals.protein.value) : Number(totals.protein),
+            fat: typeof totals.fat === 'object' ? Number(totals.fat.value) : Number(totals.fat),
+            carbohydrates: typeof totals.carbohydrates === 'object' ? Number(totals.carbohydrates.value) : Number(totals.carbohydrates)
+          },
+          labels: filteredFoodLabels,
+          barcodes: [],
+          messages
+        };
+        logger.info('Returning response:', JSON.stringify(responseObj, null, 2));
+        return responseObj;
+      } else if (barcodeDetected && (labelDescriptions.some(l => l.toLowerCase().includes('packaged')) || foodLabels.length <= 1)) {
+        // B. Barcode detected and context is packaged goods
+        logger.info('Scenario B: Barcode detected and context is packaged goods. Attempting OFF lookup by barcode.');
+        // Barcode value extraction stub (use OCR if needed)
+        let barcodeValue = null;
+        // Example: Try to extract barcode value from Vision API textAnnotations (if available)
+        if (visionResponse.textAnnotations && visionResponse.textAnnotations.length > 0) {
+          // This is a naive stub; real barcode OCR would be more robust
+          const possibleBarcode = visionResponse.textAnnotations[0].description.match(/\d{8,13}/);
+          if (possibleBarcode) barcodeValue = possibleBarcode[0];
+        }
+        let offNutritionResult = null;
+        if (barcodeValue) {
+          offNutritionResult = await getNutritionFromOFF(barcodeValue);
+        }
+        let barcodesArr = [];
+        if (barcodeObj) {
+          barcodesArr.push({
+            boundingBox: barcodeObj.boundingPoly,
+            confidence: barcodeObj.score,
+            barcodeValue,
+            nutrition: offNutritionResult
+          });
+        }
+        let ingredients = [];
+        if (offNutritionResult) {
+          ingredients.push({
+            name: offNutritionResult.foodName || 'Packaged Food',
+            source: 'Open Food Facts',
+            macros: {
+              calories: offNutritionResult.calories || 0,
+              protein: offNutritionResult.protein || 0,
+              fat: offNutritionResult.fat || 0,
+              carbohydrates: offNutritionResult.carbohydrates || 0
+            },
+            micros: offNutritionResult.microNutrients || {},
+            barcode: barcodeValue
+          });
+        }
+        let totals = {calories: 0, protein: 0, fat: 0, carbohydrates: 0};
+        try {
+          if (offNutritionResult) {
+            totals.calories = offNutritionResult.calories || 0;
+            totals.protein = offNutritionResult.protein || 0;
+            totals.fat = offNutritionResult.fat || 0;
+            totals.carbohydrates = offNutritionResult.carbohydrates || 0;
+          } else {
+            return {
+              nutrition: null,
+              message: 'Could not reliably analyze the food image. Please try again with a clearer photo.'
+            };
+          }
+        } catch (error) {
+          logger.error('Error processing nutrition data:', error);
+          return {
+            nutrition: null,
+            message: 'An error occurred while analyzing the food image.'
+          };
+        }
+      }
+      // If we reach here, fallback
+
+      // --- NEW FUNCTION: Fetch Nutrition from Open Food Facts ---
+      async function getNutritionFromOFF(foodLabel) {
+        if (!foodLabel) return null;
+        
+        // No mock data - only use real API data
+        
+        const searchLabel = encodeURIComponent(foodLabel.trim());
+        const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${searchLabel}&search_simple=1&action=process&json=1&page_size=1`;
+        
+        // Generate cache key from the API URL
+        const cacheKey = `off_${searchLabel}`;
+        
+        // Check if we have a cached response
+        const cachedData = apiUtils.getCachedResponse(cacheKey);
+        if (cachedData) {
+          logger.info(`Using cached Open Food Facts data for: ${foodLabel}`);
+          return cachedData;
+        }
+        
+        // Check if we're allowed to make a request (rate limiting)
+        if (!apiUtils.isRequestAllowed('openfoodfacts')) {
+          logger.warn(`Rate limited: Skipping Open Food Facts request for ${foodLabel}`);
+          logger.info(`No nutritional data available for ${foodLabel} due to rate limiting`);
+          return null;
+        }
+
+        logger.info(`Querying Open Food Facts for: ${foodLabel} with URL: ${url}`);
+
+        // Add a timeout to the fetch request
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+        
+        try {
+          const response = await fetch(url, { signal: controller.signal })
+            .catch(err => {
+              if (err.name === 'AbortError') {
+                logger.warn(`Open Food Facts API request timed out for: ${foodLabel}`);
+                
+                // Log the timeout and return null
+                logger.info(`Request timed out for ${foodLabel} - will rely on other data sources`);
+                clearTimeout(timeoutId);
+                return null;
+              }
+              throw err;
+            });
+            
+          clearTimeout(timeoutId);
+          
+          if (!response.ok) {
+            logger.error(`Open Food Facts API request failed with status: ${response.status}`);
+            
+            // Log the error and continue with other data sources
+            logger.info(`Will try reference database instead of OFF for ${foodLabel}`);
+            return null;
+          }
+
+          const data = await response.json();
+
+          if (data.products && data.products.length > 0) {
+            const product = data.products[0];
+            const nutriments = product.nutriments;
+
+            if (nutriments) {
+              // Extract primary macros (per 100g)
+              const macros = {
+                  calories: nutriments["energy-kcal_100g"] || nutriments["energy_100g"] / 4.184 || 0,
+                  protein: nutriments.proteins_100g || 0,
+                  fat: nutriments.fat_100g || 0,
+                  carbohydrates: nutriments.carbohydrates_100g || 0,
+              };
+              // Extract known micronutrients (per 100g) into a separate object
+              const microNutrients = {};
+              const microMap = {
+                  fiber: 'fiber_100g',
+                  sugars: 'sugars_100g',
+                  sodium: 'sodium_100g',
+                  calcium: 'calcium_100g',
+                  iron: 'iron_100g',
+                  vitaminA: 'vitamin-a_100g',
+                  vitaminC: 'vitamin-c_100g',
+                  // Add more OFF nutrient keys here as needed
+              };
+              for (const [key, offKey] of Object.entries(microMap)) {
+                  if (nutriments[offKey] !== undefined && nutriments[offKey] !== null) {
+                      // Store value and inferred unit (OFF usually uses 'g', 'mg', 'µg')
+                      let unit = 'g'; // Default
+                      if (offKey.includes('sodium') || offKey.includes('calcium') || offKey.includes('iron') || offKey.includes('vitamin')) {
+                          unit = nutriments[`${offKey}_unit`] || (offKey.includes('vitamin') ? 'µg' : 'mg'); // Try to get unit or guess common ones
+                      }
+                      // Ensure value is a number
+                      const value = typeof nutriments[offKey] === 'string' ? parseFloat(nutriments[offKey]) : nutriments[offKey];
+                      microNutrients[key] = { value: value, unit: unit };
+                  }
+              }
+              // Combine into the final object
+              const nutrition = {
+                  ...macros,
+                  microNutrients, // Group micros here
+                  // Additional Open Food Facts features
+                  barcode: product.code || null,
+                  ecoscore_score: product.ecoscore_score || null,
+                  ecoscore_grade: product.ecoscore_grade || null,
+                  nutriscore_score: product.nutriscore_score || null,
+                  nutriscore_grade: product.nutriscore_grade || null,
+                  nova_group: product.nova_group || null,
+                  image_url: product.image_url || null,
+                  source: 'Open Food Facts',
+                  foodName: product.product_name || foodLabel // Use product name if available
+              };
+              
+              // Cache the response for future use (24 hour TTL)
+              apiUtils.cacheResponse(cacheKey, nutrition);
+              
+              logger.info(`Found nutrition data for ${foodLabel} on OFF:`, nutrition);
+              return nutrition;
+            } else {
+              logger.warn(`No 'nutriments' data found for ${foodLabel} in OFF product: ${product.product_name}`);
+              return null;
+            }
+          } else {
+            logger.info(`No products found on Open Food Facts for: ${foodLabel}`);
+            return null;
+          }
+        } catch (error) {
+          logger.error(`Error fetching or parsing Open Food Facts data for ${foodLabel}:`, error);
+          return null;
+        }
+      }
+      // ---------------------------------------------------------
+
+      // --- NEW FUNCTION: Fetch Nutrition from USDA FoodData Central ---
+      /**
+       * Fetch nutrition from USDA FoodData Central API using a two-step process:
+       *  1. Search for the food to get the best FDC ID.
+       *  2. Fetch full food details using the FDC ID.
+       * Returns macros + extensive micronutrients, with USDA citation.
+       */
+      async function getNutritionFromUSDA(foodLabel) {
+        if (!foodLabel) return null;
+        
+        // Define apiKey in the wider scope so it's available throughout the function
+        let apiKey;
+        
+        try {
+          // For Cloud Functions v2, config values are available directly in process.env
+          apiKey = process.env.USDA_API_KEY;
+          
+          // Legacy config approach as fallback
+          if (!apiKey && process.env.FIREBASE_CONFIG) {
+            const config = JSON.parse(process.env.FIREBASE_CONFIG);
+            apiKey = config.usda?.api_key;
+          }
+          
+          if (!apiKey) {
+            logger.warn('USDA_API_KEY not set in environment. Skipping USDA lookup.');
+            return null;
+          }
+        } catch (error) {
+          logger.error('Error accessing USDA API key:', error);
+          return null;
+        }
+        try {
+          // Step 1: Search for the food to get FDC ID
+          const searchUrl = `https://api.nal.usda.gov/fdc/v1/foods/search?query=${encodeURIComponent(foodLabel)}&pageSize=1&api_key=${apiKey}`;
+          const searchResp = await fetch(searchUrl);
+          if (!searchResp.ok) {
+            logger.error(`USDA FoodData Central API search failed with status: ${searchResp.status}`);
+            return null;
+          }
+          const searchData = await searchResp.json();
+          if (!searchData.foods || !Array.isArray(searchData.foods) || searchData.foods.length === 0) {
+            logger.info(`No foods found on USDA FoodData Central for: ${foodLabel}`);
+            return null;
+          }
+          const food = searchData.foods[0];
+          const fdcId = food.fdcId;
+          if (!fdcId) {
+            logger.warn(`No FDC ID found for food: ${foodLabel}`);
+            return null;
+          }
+
+          // Step 2: Fetch full food details
+          const detailsUrl = `https://api.nal.usda.gov/fdc/v1/food/${fdcId}?api_key=${apiKey}`;
+          const detailsResp = await fetch(detailsUrl);
+          if (!detailsResp.ok) {
+            logger.error(`USDA FoodData Central API details fetch failed with status: ${detailsResp.status}`);
+            return null;
+          }
+          const detailsData = await detailsResp.json();
+
+          // Extract nutrients
+          const nutrients = {};
+          if (Array.isArray(detailsData.foodNutrients)) {
+            for (const n of detailsData.foodNutrients) {
+              if (!n.nutrientName || (n.amount == null && n.value == null)) continue;
+              // Prefer amount, fallback to value
+              const value = n.amount != null ? n.amount : n.value;
+              const name = n.nutrientName.toLowerCase().replace(/[^a-z0-9]/g, '_');
+              nutrients[name] = {
+                value: value,
+                unit: n.unitName,
+                originalName: n.nutrientName
+              };
+            }
+          }
+          // Map common macros for merging
+          const macros = {
+            calories: nutrients.energy ? nutrients.energy.value : undefined,
+            protein: nutrients.protein ? nutrients.protein.value : undefined,
+            fat: nutrients.total_fat ? nutrients.total_fat.value : undefined,
+            carbohydrates: nutrients.carbohydrate_by_difference ? nutrients.carbohydrate_by_difference.value : undefined
+          };
+          Object.keys(macros).forEach(k => macros[k] === undefined && delete macros[k]);
+          // Gather vitamins/minerals
+          const vitaminsAndMinerals = {};
+          for (const [key, val] of Object.entries(nutrients)) {
+            if (!['energy','protein','total_fat','carbohydrate_by_difference'].includes(key)) {
+              vitaminsAndMinerals[val.originalName] = { value: val.value, unit: val.unit };
+            }
+          }
+          // Add USDA citation as recommended
+          const usdaCitation = 'U.S. Department of Agriculture, Agricultural Research Service. FoodData Central, 2019. fdc.nal.usda.gov.';
+          return {
+            ...macros,
+            microNutrients: vitaminsAndMinerals,
+            source: 'USDA FoodData Central',
+            citation: usdaCitation,
+            foodName: detailsData.description || foodLabel
+          };
+        } catch (error) {
+          logger.error(`Error fetching or parsing USDA FoodData Central data for ${foodLabel}:`, error);
+          return null;
+        }
+      }
+      // ---------------------------------------------------------
+
+      // Filter out non-food or very generic labels for packaged food
+      const packagedNonFoodLabels = new Set(['tableware', 'dishware', 'food', 'ingredient', 'recipe', 'produce']); // Add more if needed
+      const packagedFilteredLabels = labelDescriptions // Use the array of strings
+        .map(label => label.toLowerCase()) // Now label is guaranteed to be a string
+        .filter(label => !packagedNonFoodLabels.has(label));
+
+      logger.info('Labels considered for nutrition lookup (packaged food):', packagedFilteredLabels);
+
+      let nutritionResult = null;
+      let usdaNutritionResult = null;
+
+      // Process all labels for nutrition lookup to get a more complete picture
+      let allNutritionResults = [];
+      let allUsdaNutritionResults = [];
+      
+      for (const label of filteredFoodLabels) {
+        // Try Open Food Facts
+        const offResult = await getNutritionFromOFF(label);
+        if (offResult) {
+          allNutritionResults.push({ label, data: offResult });
+          logger.info(`Fetched nutrition for '${label}' from Open Food Facts`);
+        }
+        
+        // Try USDA FoodData Central
+        const usdaResult = await getNutritionFromUSDA(label);
+        if (usdaResult) {
+          allUsdaNutritionResults.push({ label, data: usdaResult });
+          logger.info(`Fetched nutrition for '${label}' from USDA FoodData Central`);
+        }
+        
+        // Set for backward compatibility
+        if (!nutritionResult && offResult) nutritionResult = offResult;
+        if (!usdaNutritionResult && usdaResult) usdaNutritionResult = usdaResult;
+      }
+      
+      logger.info(`Found nutrition data for ${allNutritionResults.length} items from OFF and ${allUsdaNutritionResults.length} items from USDA`);
+
+      // Merge logic: combine macros and micronutrients from both sources
+      let mergedResult = null;
+      // Merge nutrition results from all three sources with priority: USDA > FatSecret > OFF
+      const fatSecretNutritionResult = filteredFoodLabels.length > 0 ? await fatSecretAPI.getNutritionFromFatSecret(filteredFoodLabels[0]) : null;
+      
+      if (nutritionResult || usdaNutritionResult || fatSecretNutritionResult) {
+        mergedResult = {
+          calories: usdaNutritionResult?.calories || fatSecretNutritionResult?.calories || nutritionResult?.calories || 0,
+          protein: usdaNutritionResult?.protein || fatSecretNutritionResult?.protein || nutritionResult?.protein || 0,
+          fat: usdaNutritionResult?.fat || fatSecretNutritionResult?.fat || nutritionResult?.fat || 0,
+          carbohydrates: usdaNutritionResult?.carbohydrates || fatSecretNutritionResult?.carbohydrates || nutritionResult?.carbohydrates || 0,
+          foodName: nutritionResult?.foodName || fatSecretNutritionResult?.foodName || usdaNutritionResult?.foodName || filteredFoodLabels[0] || 'Detected Food',
+          microNutrients: {
+            ...(nutritionResult?.microNutrients || {}),
+            ...(fatSecretNutritionResult?.microNutrients || {}),
+            ...(usdaNutritionResult?.microNutrients || {})
+          }
+        };
+        
+        // Add sources for tracking
+        const sources = [];
+        if (usdaNutritionResult) sources.push('USDA');
+        if (fatSecretNutritionResult) sources.push('FatSecret');
+        if (nutritionResult) sources.push('OFF');
+        
+        if (sources.length > 0) {
+          mergedResult.sources = sources;
+        }
+        
+        // If there are any explicitly added properties, remove them
+        if (mergedResult.source) delete mergedResult.source;
+      }
+
+      // If no data found via OFF or USDA, use fallback
+      if (!mergedResult) {
+        logger.warn('No detected items matched Open Food Facts or USDA FoodData Central data. Returning estimated average values.');
+        mergedResult = {
+          calories: 250,
+          protein: 15,
+          fat: 10,
+          carbohydrates: 20,
+          foodName: filteredFoodLabels[0] || 'Detected Food' // Use first label or generic name
+        };
+
+      }
+
+      // --- Return the result (either from OFF or fallback) ---
+      // TODO: Store scan result in Firestore (consider adding user ID)
+      return {
+        success: true,
+        labels: result.labelAnnotations.map(label => label.description),
+        nutrition: mergedResult
+      };
+    } catch (error) {
+      logger.error('Error during image analysis:', error);
+      throw new HttpsError('internal', 'Error processing image analysis.', error.message);
+    }
+  }
+  
+// Export the handler function for middleware use in index.js
+}}}}}}}
+
+// Exports
+exports.analyzeFoodImageHandler = analyzeFoodImageHandler;
+exports.analyzeFoodImage = onCall(
+  { enforceAppCheck: true, memory: "512MiB" },
+  analyzeFoodImageHandler
+);
+
+// Get food scan result
+exports.getFoodScanResult = onCall(
+  {
+    enforceAppCheck: true,
+  },
+  async (data, context) => {
+    // Authentication check
+    if (!context.auth) {
+      throw new HttpsError(
+        'unauthenticated',
+        'The function must be called while authenticated.'
+      );
+    }
+    
+    // Placeholder implementation
+    return {
+      success: true,
+      scan: {
+        id: data.scanId || "placeholder-scan-id",
+        timestamp: Timestamp.now(),
+        items: []
+      }
+    };
+  }
+);

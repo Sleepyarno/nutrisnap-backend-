@@ -1,0 +1,43 @@
+// Learn tab security rules for NutriSnap
+// These rules should be integrated into the main firestore.rules file
+
+// Rules for the knowledgeBaseArticles collection
+match /knowledgeBaseArticles/{articleId} {
+  // Anyone can read articles (they're educational content)
+  allow read: if true;
+  
+  // Only admins can create, update, or delete articles
+  allow write: if request.auth != null && request.auth.token.admin == true;
+}
+
+// Rules for the optional knowledgeBaseCategories collection
+match /knowledgeBaseCategories/{categoryId} {
+  // Anyone can read categories
+  allow read: if true;
+  
+  // Only admins can create, update, or delete categories
+  allow write: if request.auth != null && request.auth.token.admin == true;
+}
+
+// Rules for user-specific interactions with knowledge base content
+match /users/{userId}/bookmarkedArticles/{articleId} {
+  // Users can only access their own bookmarked articles
+  allow read, write: if request.auth != null && request.auth.uid == userId;
+}
+
+match /users/{userId}/readArticles/{articleId} {
+  // Users can only access their own read history
+  allow read, write: if request.auth != null && request.auth.uid == userId;
+}
+
+// Optional rules for article feedback/ratings
+match /articleFeedback/{feedbackId} {
+  // Users can read all feedback
+  allow read: if true;
+  
+  // Users can only create feedback if authenticated
+  allow create: if request.auth != null;
+  
+  // Users can only update/delete their own feedback
+  allow update, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+}

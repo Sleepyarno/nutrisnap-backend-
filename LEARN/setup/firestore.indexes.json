@@ -1,0 +1,37 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "knowledgeBaseArticles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "category", "order": "ASCENDING" },
+        { "fieldPath": "publicationDate", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledgeBaseArticles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "isFeatured", "order": "ASCENDING" },
+        { "fieldPath": "publicationDate", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledgeBaseArticles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "articleType", "order": "ASCENDING" },
+        { "fieldPath": "publicationDate", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledgeBaseArticles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "tags", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "publicationDate", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

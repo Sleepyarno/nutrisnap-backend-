@@ -1,0 +1,1564 @@
+/* eslint-env node 
+// NutriSnap backend now uses both Open Food Facts and USDA FoodData Central API for nutrition dat
+
+// USDA API KEY MANAGEMEN
+// - For local development, use a .env with USDA_API_KEY=your_key and ensure dotenv is loade
+// - For production (Firebase Cloud Functions), use: firebase functions:config:set usda.api_key="your_ke
+//   The code will automatically use the right key for each environmen
+// Load .env for local d
+try { require('dotenv').config(); } catch (e) { /* ignore if dotenv not installed */
+const functions = require('firebase-functions'
+const admin = require('firebase-admin'
+const vision = require('@google-cloud/vision'
+const { Timestamp } = require('firebase-admin/firestore'
+const logger = require("firebase-functions/logger"); // Import the logg
+// Import LLM enhancer (fail if missin
+let enhanceFoodDetectio
+try
+  ({ enhanceFoodDetection } = require('./llmEnhancer')
+  if (typeof enhanceFoodDetection !== 'function')
+    throw new Error('enhanceFoodDetection is not a function'
+ 
+  console.info('LLM enhancer loaded successfully.'
+} catch (error)
+  console.error('FATAL: LLM enhancer module could not be loaded. Food detection will not work without it.', error
+  throw erro
+
+// Import API utilities with fallba
+let apiUtil
+try
+  apiUtils = require('../utils/apiUtils'
+} catch (error)
+  console.warn('API utils module not found, using fallback implementation'
+  apiUtils =
+    // Add any methods used in the code as need
+  
+
+// Import FatSecret API utilities with fallback to prevent erro
+let fatSecretAP
+try
+  fatSecretAPI = require('../utils/fatSecretAPI'
+} catch (error)
+  console.warn('FatSecret API module not found, using fallback implementation'
+  fatSecretAPI =
+    getNutritionFromFatSecret: async (foodQuery) =>
+      console.log(`(FALLBACK) FatSecret nutrition lookup for '${foodQuery}' would happen here`
+      return nul
+   
+  
+
+// Initialize Vision API client with default credentia
+let visionClient = nul
+async function getVisionClient()
+  if (!visionClient)
+    try
+      // Initialize the Vision client using default credentia
+      visionClient = new vision.ImageAnnotatorClient(
+      logger.info('Vision API client initialized successfully using default credentials.'
+    } catch (error)
+      // Log the detailed error if initialization fai
+      logger.error('Failed to initialize Vision API client with default credentials:', error
+      // Re-throw the error to ensure the main function logic catches 
+      throw erro
+   
+ 
+  return visionClien
+
+// Analyze food ima
+const { onCall } = require("firebase-functions/v2/https"
+// Utility to filter out non-food labels from Vision A
+function isFoodItem(label)
+  // Early return for empty labe
+  if (!label || typeof label !== 'string') return fals
+
+  const lowerLabel = label.toLowerCase(
+
+  // Definite food items to always inclu
+  const definiteFoodItems =
+    'egg', 'bacon', 'sausage', 'bean', 'tomato', 'mushroom', 'toast', 'bread
+    'chicken', 'beef', 'pork', 'fish', 'lamb', 'steak', 'potato', 'rice', 'pasta
+    'vegetable', 'fruit', 'cheese', 'yogurt', 'milk', 'cream', 'butter', 'oil
+    'nut', 'seed', 'cereal', 'grain', 'soup', 'salad', 'sandwich', 'wrap', 'burger
+    'pizza', 'pasta', 'noodle', 'dumpling', 'taco', 'burrito', 'sushi', 'seafoo
+  
+
+  // If the label contains any definite food items, include 
+  if (definiteFoodItems.some(item => lowerLabel.includes(item)))
+    return tru
+ 
+
+  // Non-food items to exclu
+  const nonFoodLabels =
+    // Non-food ite
+    'tableware', 'dishware', 'plate', 'recipe', 'utensil
+    'crockery', 'cutlery', 'bowl', 'fork', 'spoon', 'knife
+    // Generic food containe
+    'container', 'box', 'package', 'wrapper
+    // Camera and image-related ter
+    'camera', 'photo', 'picture', 'image', 'photograph
+  
+
+  // We're keeping some terms that were previously filtered out, like 'ingredient', 'cuisine', 'meal', 'foo
+  // as they can be helpful signals when combined with LLM processi
+
+  return !nonFoodLabels.includes(lowerLabel
+
+// Utility function to score how specific/descriptive a food label 
+// Higher score = more specific and useful for identificati
+function getFoodSpecificityScore(label)
+  if (!label) return 
+
+  const lowerLabel = label.toLowerCase(
+
+  // Specific food components get high scor
+  const specificFoods =
+    // Breakfast componen
+    'egg': 6, 'eggs': 6, 'fried egg': 7, 'scrambled egg': 
+    'bacon': 7, 'sausage': 6, 'sausages': 6, 'pork sausage': 
+    'baked beans': 7, 'beans': 5, 'grilled tomato': 7, 'tomato': 
+    'mushroom': 6, 'toast': 5, 'bread': 4, 'black pudding': 
+    'hash brown': 7, 'fried bread': 
+  
+    // Meat and protei
+    'chicken': 5, 'beef': 5, 'pork': 5, 'lamb': 5, 'fish': 5, 'steak': 
+    'chicken breast': 7, 'beef steak': 7, 'salmon': 7, 'tuna': 
+    'cod': 7, 'shrimp': 7, 'prawn': 
+  
+    // Complex dishes (give these high scores to preserve the
+    'pizza': 7, 'burger': 7, 'sandwich': 6, 'salad': 6, 'pasta': 
+    'risotto': 7, 'curry': 6, 'soup': 6, 'stew': 6, 'casserole': 
+    'lasagna': 7, 'sushi': 7, 'taco': 7, 'burrito': 7, 'wrap': 
+    'noodles': 6, 'stir fry': 7, 'roast dinner': 7, 'english breakfast': 
+    'full breakfast': 8, 'full english': 8, 'english':
+  
+
+  // Generic categories get lower scor
+  const genericCategories =
+    'breakfast': 
+    'meat': 
+    'vegetable': 
+    'fruit': 
+    'food': 
+    'dish': 
+    'meal': 
+    'dairy': 2
+    'grain': 
+    'protein': 
+    'carbohydrate':
+  
+
+  // First check for exact matches in specific foods (highest priorit
+  if (specificFoods[lowerLabel])
+    return specificFoods[lowerLabel
+ 
+
+  // Then check for partial matches in specific foo
+  for (const food in specificFoods)
+    // Exact word boundary matches score high
+    const words = lowerLabel.split(' '
+    if (words.includes(food))
+      return specificFoods[food] - 1; // Slightly lower than exact mat
+   
+  
+    // Partial inclusi
+    if (lowerLabel.includes(food))
+      return specificFoods[food] - 2; // Lower than word boundary mat
+   
+ 
+
+  // Check if this is a generic catego
+  for (const category in genericCategories)
+    if (lowerLabel === category)
+      return genericCategories[category
+   
+    if (lowerLabel.includes(category))
+      return genericCategories[category] - 0.5; // Slightly lower for partial match
+   
+ 
+
+  // Default score for unrecognized items based on specificity heuristi
+  // More words typically means more specific descripti
+  const wordCount = lowerLabel.split(' ').lengt
+  if (wordCount >= 3) return 4; // More specific descriptio
+  if (wordCount === 2) return 3; // Somewhat specif
+
+  // Single words not in our dictionaries get a modest sco
+  return 
+
+// Clean up ingredient names for better displ
+function cleanIngredientName(name)
+  if (!name) return '
+
+  // Title case formatti
+  const formattedName = name.split(' 
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase(
+    .join(' '
+
+  return formattedNam
+
+// Utility to fetch nutrition data from USDA A
+async function getNutritionFromUSDA(foodQuery)
+  try
+    if (!foodQuery) return nul
+  
+    // Get API key from environment or Firebase conf
+    let apiKey = process.env.USDA_API_KE
+  
+    // Check if we have the API key availab
+    if (!apiKey)
+      logger.warn('USDA_API_KEY not set in environment. Skipping USDA lookup.'
+      return nul
+   
+  
+    // Generate cache k
+    const cacheKey = `usda_nutrition_${foodQuery.toLowerCase().trim()}
+  
+    // Check cache fir
+    const cachedResult = apiUtils.getCachedResponse(cacheKey
+    if (cachedResult)
+      logger.debug(`Using cached USDA nutrition data for "${foodQuery}"`
+      return cachedResul
+   
+  
+    // Call the USDA A
+    logger.info(`Searching USDA FoodData Central for '${foodQuery}'`
+  
+    // Use search endpoint first to find the fo
+    const fetch = require('node-fetch'
+    const searchResponse = await fetc
+      `https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${apiKey}&query=${encodeURIComponent(foodQuery)}&dataType=SR%20Legacy,Survey%20%28FNDDS%29&pageSize=5
+     
+        method: 'GET
+        headers: { 'Content-Type': 'application/json'
+     
+    
+  
+    if (!searchResponse.ok)
+      logger.error(`USDA API search error: ${searchResponse.status} ${searchResponse.statusText}`
+      return nul
+   
+  
+    const searchData = await searchResponse.json(
+  
+    // No results fou
+    if (!searchData.foods || searchData.foods.length === 0)
+      logger.info(`No USDA results found for '${foodQuery}'`
+      return nul
+   
+  
+    // Get the first result (best matc
+    const bestMatch = searchData.foods[0
+  
+    // Convert to our standardized form
+    const nutritionData =
+      calories: 
+      protein: 
+      fat: 
+      carbohydrates: 
+      foodName: bestMatch.description || foodQuer
+      servingSize: '100g
+      source: 'USDA
+      microNutrients: 
+    
+  
+    // Extract nutrien
+    if (bestMatch.foodNutrients)
+      bestMatch.foodNutrients.forEach(nutrient =>
+        // Map USDA nutrient IDs to our properti
+        // https://fdc.nal.usda.gov/docs/nutrient_numbers_USDA_nutrients_SR_LN.p
+        switch (nutrient.nutrientId)
+          case 1008: // Energy (kca
+            nutritionData.calories = nutrient.value || 
+            brea
+          case 1003: // Prote
+            nutritionData.protein = nutrient.value || 
+            brea
+          case 1004: // Total lipid (fa
+            nutritionData.fat = nutrient.value || 
+            brea
+          case 1005: // Carbohydrate, by differen
+            nutritionData.carbohydrates = nutrient.value || 
+            brea
+          case 1079: // Fiber, total dieta
+            nutritionData.microNutrients.fiber = nutrient.value || 
+            brea
+          case 2000: // Sugars, tot
+            nutritionData.microNutrients.sugar = nutrient.value || 
+            brea
+          case 1093: // Sodi
+            nutritionData.microNutrients.sodium = nutrient.value || 
+            brea
+          case 1092: // Potassi
+            nutritionData.microNutrients.potassium = nutrient.value || 
+            brea
+       
+      }
+   
+  
+    // Cache the results (24 hour
+    apiUtils.cacheResponse(cacheKey, nutritionData
+  
+    logger.info(`Found USDA nutrition data for '${foodQuery}'`
+    return nutritionDat
+  } catch (error)
+    logger.error(`Error fetching USDA nutrition for '${foodQuery}':`, error
+    return nul
+ 
+
+// Utility to fetch nutrition data from Open Food Facts A
+async function getNutritionFromOFF(foodQuery)
+  try
+    if (!foodQuery) return nul
+  
+    // Generate cache k
+    const cacheKey = `off_nutrition_${foodQuery.toLowerCase().trim()}
+  
+    // Check cache fir
+    const cachedResult = apiUtils.getCachedResponse(cacheKey
+    if (cachedResult)
+      logger.debug(`Using cached OFF nutrition data for "${foodQuery}"`
+      return cachedResul
+   
+  
+    // Check if we can make this request (rate limitin
+    if (!apiUtils.isRequestAllowed('openfoodfacts'))
+      logger.warn(`Rate limited: Skipping Open Food Facts lookup for '${foodQuery}'`
+      return nul
+   
+  
+    // Call the Open Food Facts A
+    logger.info(`Searching Open Food Facts for '${foodQuery}'`
+  
+    const fetch = require('node-fetch'
+    const searchResponse = await fetc
+      `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(foodQuery)}&search_simple=1&action=process&json=1&page_size=5
+     
+        method: 'GET
+        headers:
+          'User-Agent': 'NutriSnap - Food Analysis App - Contact: contact@nutrisnap.ap
+       
+     
+    
+  
+    // Record this request for rate limiti
+    apiUtils.recordRequest('openfoodfacts'
+  
+    if (!searchResponse.ok)
+      logger.error(`Open Food Facts API error: ${searchResponse.status} ${searchResponse.statusText}`
+      apiUtils.recordFailure('openfoodfacts', searchResponse.status
+      return nul
+   
+  
+    const searchData = await searchResponse.json(
+  
+    // No results fou
+    if (!searchData.products || searchData.products.length === 0)
+      logger.info(`No Open Food Facts results found for '${foodQuery}'`
+      return nul
+   
+  
+    // Get the first result (best matc
+    const bestMatch = searchData.products[0
+  
+    // Convert to our standardized form
+    const nutritionData =
+      calories: 
+      protein: 
+      fat: 
+      carbohydrates: 
+      foodName: bestMatch.product_name || foodQuer
+      servingSize: bestMatch.serving_size || '100g
+      source: 'OpenFoodFacts
+      barcode: bestMatch.code || nul
+      ingredients: bestMatch.ingredients_text || '
+      microNutrients: 
+    
+  
+    // Extract nutrient da
+    if (bestMatch.nutriments)
+      const n = bestMatch.nutriment
+    
+      // Standardize to per 100g valu
+      nutritionData.calories = n['energy-kcal_100g'] || n['energy-kcal'] || n['energy_100g'] / 4.184 || 
+      nutritionData.protein = n['proteins_100g'] || n.proteins || 
+      nutritionData.fat = n['fat_100g'] || n.fat || 
+      nutritionData.carbohydrates = n['carbohydrates_100g'] || n.carbohydrates || 
+    
+      // Extract micronutrien
+      nutritionData.microNutrients.fiber = n['fiber_100g'] || n.fiber || 
+      nutritionData.microNutrients.sugar = n['sugars_100g'] || n.sugars || 
+      nutritionData.microNutrients.sodium = n['sodium_100g'] || n.sodium || 
+      nutritionData.microNutrients.potassium = n['potassium_100g'] || n.potassium || 
+      nutritionData.microNutrients.saturatedFat = n['saturated-fat_100g'] || n['saturated_fat'] || 
+   
+  
+    // Cache the results (24 hour
+    apiUtils.cacheResponse(cacheKey, nutritionData
+  
+    logger.info(`Found Open Food Facts nutrition data for '${foodQuery}'`
+    return nutritionDat
+  } catch (error)
+    logger.error(`Error fetching OFF nutrition for '${foodQuery}':`, error
+    return nul
+ 
+
+// Reference nutrition database function (fallback when APIs fai
+function getReferenceNutritionData(detectedBarcodes, foodLabels)
+  console.log('Getting reference nutrition data for:', foodLabels
+
+  // Common food categories to match again
+  const categories =
+    breakfast: ['breakfast', 'cereal', 'egg', 'bacon', 'sausage', 'pancake', 'waffle', 'toast'
+    meat: ['meat', 'beef', 'pork', 'lamb', 'chicken', 'turkey', 'sausage', 'steak'
+    dairy: ['milk', 'cheese', 'yogurt', 'cream', 'butter', 'dairy'
+    fruit: ['fruit', 'apple', 'banana', 'orange', 'berry', 'strawberry', 'blueberry'
+    vegetable: ['vegetable', 'salad', 'broccoli', 'carrot', 'spinach', 'kale', 'lettuce'
+    dessert: ['dessert', 'cake', 'cookie', 'ice cream', 'chocolate', 'candy', 'sweet'
+    fastfood: ['burger', 'pizza', 'fries', 'fast food', 'sandwich', 'hot dog', 'taco
+  
+
+  // Default valu
+  let categoryMatch = 'other
+  let nutritionTemplate =
+    calories: 25
+    protein: 1
+    carbohydrates: 3
+    fat: 1
+    microNutrients: { fiber: 2, sugar: 5, sodium: 500, potassium: 200
+  
+
+  // Try to match detected food to a catego
+  for (const [category, keywords] of Object.entries(categories))
+    if (foodLabels.some(label => keywords.some(keyword =
+      label.toLowerCase().includes(keyword.toLowerCase(
+    )))
+      categoryMatch = categor
+      brea
+   
+ 
+
+  // Adjust nutrition values based on food catego
+  switch (categoryMatch)
+    case 'breakfast
+      nutritionTemplate =
+        calories: 45
+        protein: 2
+        carbohydrates: 4
+        fat: 2
+        microNutrients: { fiber: 3, sugar: 8, sodium: 800, potassium: 300
+      
+      brea
+    case 'meat
+      nutritionTemplate =
+        calories: 30
+        protein: 2
+        carbohydrates: 
+        fat: 2
+        microNutrients: { fiber: 0, sugar: 0, sodium: 600, potassium: 400
+      
+      brea
+    case 'dairy
+      nutritionTemplate =
+        calories: 20
+        protein: 1
+        carbohydrates: 1
+        fat: 1
+        microNutrients: { fiber: 0, sugar: 10, sodium: 150, potassium: 250
+      
+      brea
+    case 'fruit
+      nutritionTemplate =
+        calories: 12
+        protein: 
+        carbohydrates: 2
+        fat: 
+        microNutrients: { fiber: 4, sugar: 20, sodium: 5, potassium: 350
+      
+      brea
+    case 'vegetable
+      nutritionTemplate =
+        calories: 8
+        protein: 
+        carbohydrates: 1
+        fat: 
+        microNutrients: { fiber: 5, sugar: 3, sodium: 40, potassium: 400
+      
+      brea
+    case 'dessert
+      nutritionTemplate =
+        calories: 35
+        protein: 
+        carbohydrates: 5
+        fat: 1
+        microNutrients: { fiber: 1, sugar: 35, sodium: 200, potassium: 150
+      
+      brea
+    case 'fastfood
+      nutritionTemplate =
+        calories: 65
+        protein: 2
+        carbohydrates: 6
+        fat: 3
+        microNutrients: { fiber: 2, sugar: 10, sodium: 1200, potassium: 500
+      
+      brea
+ 
+
+  // Create ingredie
+  const mainIngredient =
+    name: foodLabels[0] || 'Detected Food
+    nutrition:
+      calories: nutritionTemplate.calorie
+      protein: nutritionTemplate.protei
+      carbohydrates: nutritionTemplate.carbohydrate
+      fat: nutritionTemplate.fa
+      microNutrients: {...nutritionTemplate.microNutrient
+    
+    message: 'Estimated nutrition values based on detected food
+  
+
+  // Add additional ingredients if multiple food items detect
+  const ingredients = [mainIngredient
+  if (foodLabels.length > 1)
+    // Add secondary ingredients with scaled down valu
+    for (let i = 1; i < Math.min(4, foodLabels.length); i++)
+      ingredients.push
+        name: foodLabels[i
+        nutrition:
+          calories: Math.round(nutritionTemplate.calories * 0.5
+          protein: Math.round(nutritionTemplate.protein * 0.5
+          carbohydrates: Math.round(nutritionTemplate.carbohydrates * 0.5
+          fat: Math.round(nutritionTemplate.fat * 0.
+        
+        message: 'Estimated component based on detected food
+      }
+   
+ 
+
+  // Calculate tota
+  const totals =
+    calories: nutritionTemplate.calorie
+    protein: nutritionTemplate.protei
+    carbohydrates: nutritionTemplate.carbohydrate
+    fat: nutritionTemplate.fa
+    microNutrients: {...nutritionTemplate.microNutrient
+  
+
+  // Return resu
+  return
+    ingredients: ingredient
+    totals: tota
+  
+
+// Function to calculate nutrition from ingredients (fallbac
+function calculateNutritionFromIngredients(detectedBarcodes, foodLabels)
+  // Similar logic to getReferenceNutritionData but could be more sophisticat
+  return getReferenceNutritionData(detectedBarcodes, foodLabels
+
+// Note: FatSecret API client is now imported at the top with fallba
+// Note: enhanceFoodDetection is now imported at the top and required (no fallback allowe
+/
+ * Classify meal type based on ingredients and food labe
+ * @param {Array} ingredients List of ingredient objec
+ * @param {Array} foodLabels List of food label strin
+ * @returns {string} The classified meal ty
+ 
+function classifyMeal(ingredients, foodLabels)
+  // Common meal type keywor
+  const mealKeywords =
+    breakfast: ['breakfast', 'cereal', 'pancake', 'waffle', 'egg', 'bacon', 'toast', 'oatmeal', 'yogurt'
+    lunch: ['sandwich', 'salad', 'soup', 'wrap', 'burger', 'lunch'
+    dinner: ['dinner', 'steak', 'chicken', 'fish', 'pasta', 'rice', 'potato', 'roast', 'casserole'
+    snack: ['snack', 'chips', 'cracker', 'cookie', 'bar', 'nuts', 'fruit'
+    dessert: ['dessert', 'cake', 'ice cream', 'pudding', 'pie', 'chocolate', 'cookie', 'sweet'
+    beverage: ['drink', 'beverage', 'coffee', 'tea', 'juice', 'smoothie', 'soda', 'water
+  
+
+  // Count matches for each meal ty
+  const matchCounts = {
+  Object.keys(mealKeywords).forEach(type => matchCounts[type] = 0
+
+  // Check ingredients and food labels for meal type keywor
+  const allTerms =
+    ...foodLabels
+    ...ingredients.map(ing => ing.name || '
+  
+
+  allTerms.forEach(term =>
+    if (!term) retur
+    const lowerTerm = term.toLowerCase(
+  
+    Object.entries(mealKeywords).forEach(([type, keywords]) =>
+      if (keywords.some(keyword => lowerTerm.includes(keyword)))
+        matchCounts[type]+
+     
+    }
+  }
+
+  // Get the meal type with the most match
+  let bestMatch = 'meal'; // Default if no match
+  let maxMatches = 
+
+  Object.entries(matchCounts).forEach(([type, count]) =>
+    if (count > maxMatches)
+      maxMatches = coun
+      bestMatch = typ
+   
+  }
+
+  // Special case for time-of-day based classificati
+  // If no strong match, use time-of-day as a fallba
+  if (maxMatches === 0)
+    const hour = new Date().getHours(
+    if (hour >= 5 && hour < 11) return 'Breakfast
+    if (hour >= 11 && hour < 15) return 'Lunch
+    if (hour >= 15 && hour < 18) return 'Snack
+    if (hour >= 18 && hour < 22) return 'Dinner
+    return 'Meal
+ 
+
+  return bestMatch.charAt(0).toUpperCase() + bestMatch.slice(1
+
+// 2nd-gen onCall: handler receives a single 'request' paramet
+exports.analyzeFoodImage = onCal
+  { enforceAppCheck: true, memory: "2GiB" 
+  async (request) =>
+    // Wrap everything in a single try-catch blo
+    try
+      console.log("analyzeFoodImage function called"
+      // Destructure data and auth from request (2nd-gen signatur
+      const { data, auth } = reques
+      console.log("Auth present:", !!auth
+      console.log("Data contains image URL:", !!data?.imageUrl
+      // Enforce authentication via Firebase Au
+      if (!auth)
+        console.error("No authentication provided to analyzeFoodImage"
+        throw new functions.https.HttpsErro
+          'unauthenticated
+          'The function must be called while authenticated
+        
+     
+      console.log("User is authenticated via Firebase Auth:", auth.uid
+      // The image URL is requir
+      const imageUrl = data.imageUr
+      if (!imageUrl)
+        throw new functions.https.HttpsErro
+          'invalid-argument
+          'Missing image UR
+        
+     
+    
+      // Extract image name from URL to use as meal ID (consistent with iOS ap
+      let mealI
+      if (data.mealId)
+        mealId = data.mealI
+      } else
+        // Try to extract the image name from the URL which is typically a UU
+        // Extract filename from Firebase Storage U
+        const storageUrlPattern = /images%2F([\w-]+)\.(jpg|jpeg|png)/
+        const match = imageUrl.match(storageUrlPattern
+      
+        if (match && match[1])
+          // Use the image filename without extension as meal
+          mealId = match[1
+          logger.info(`Extracted image filename as mealId: ${mealId}`
+        } else
+          // Fallback to Firestore generated 
+          mealId = admin.firestore().collection('meals').doc().i
+          logger.info(`Generated Firestore ID for mealId: ${mealId}`
+       
+     
+    
+      logger.info("Starting real image analysis for imageUrl: " + imageUrl, { userId: auth.uid, mealId }
+      const visionClient = await getVisionClient(
+      // Download image as buff
+      const fetch = require('node-fetch'); // Used for both OFF and USDA reques
+      const response = await fetch(imageUrl
+      if (!response.ok)
+        throw new Error(`Failed to download image: ${response.status} ${response.statusText}`
+     
+      let imageBuffer = await response.buffer(
+    
+      // Run Vision API analys
+      logger.info('Running Vision API analysis...'
+      const result = await visionClient.annotateImage
+        image: { content: imageBuffer.toString('base64') 
+        features:
+          { type: 'LABEL_DETECTION', maxResults: 20 
+          { type: 'OBJECT_LOCALIZATION', maxResults: 20
+       
+      }
+    
+      // Explicitly free up the buffer memo
+      // This is important as the image buffer can be quite large (several M
+      imageBuffer = nul
+    
+      // Extract resul
+      const visionLabels = result[0].labelAnnotations || [
+      const localizedObjects = result[0].localizedObjectAnnotations || [
+    
+      logger.info('Vision API labels:', visionLabels.map(l => l.description)
+      logger.info('Vision API object localizations:', localizedObjects.map(o => `${o.name} (${o.score})`)
+    
+      // Extract all food-related labe
+      const labelDescriptions = visionLabels.map(label => label.description
+      const foodLabels = visionLabe
+        .filter(label => isFoodItem(label.description
+        .sort((a, b) => b.score - a.score) // Sort by confidence sco
+        .map(label => label.description
+      
+      // Detect if this is an English breakfast from the labe
+      const isEnglishBreakfast = labelDescriptions.some(label =
+        label.toLowerCase().includes('english breakfast') |
+        label.toLowerCase().includes('full breakfast
+      
+    
+      // Check for multiple breakfast componen
+      const breakfastComponents = ['egg', 'sausage', 'bacon', 'bean', 'tomato', 'toast', 'mushroom'
+      const detectedBreakfastComponents = labelDescriptions.filter(label =
+        breakfastComponents.some(component => label.toLowerCase().includes(component
+      
+    
+      // Log English breakfast detection for debuggi
+      if (isEnglishBreakfast || detectedBreakfastComponents.length >= 2)
+        logger.info('ENGLISH BREAKFAST DETECTED - Components: ' 
+          detectedBreakfastComponents.join(', ')
+     
+      // --- Barcode detection (default to false unless implemented) -
+      let barcodeDetected = false; // Set to true if barcode is detected from Vision API or another meth
+    
+      // Include high-confidence object detections as additional food ite
+      const objectLabels = localizedObjec
+        .filter(obj => isFoodItem(obj.name) && obj.score > 0.
+        .map(obj => obj.name
+      
+      // Combine all detectio
+      let allFoodLabels = [...foodLabels, ...objectLabels
+    
+      // First, calculate specificity scores for each lab
+      const scoredLabels = allFoodLabels.map(label =>
+        // Find the vision label to get confidence sco
+        const visionLabel = labelAnnotations.find(anno => anno.description === label
+        const objLabel = localizedObjects.find(obj => obj.name === label
+      
+        // Calculate scor
+        const confidence = visionLabel?.score || objLabel?.score || 0.
+        const specificity = getFoodSpecificityScore(label
+      
+        // Combined score favors specific, high-confidence detectio
+        return
+          labe
+          confidenc
+          specificit
+          combinedScore: confidence * specifici
+        
+      }
+    
+      // Sort by combined score (highest firs
+      scoredLabels.sort((a, b) => b.combinedScore - a.combinedScore
+    
+      // Take top labels but avoid duplicates while preserving distinct food componen
+      const uniqueLabels = [
+      const uniqueLabelTexts = new Set(
+    
+      for (const item of scoredLabels)
+        const lowerLabel = item.label.toLowerCase(
+      
+        // Skip if we already have this exact lab
+        if (uniqueLabelTexts.has(lowerLabel)) continu
+      
+        // A more nuanced approach to similar label detection that preserves component foo
+        let tooSimilar = fals
+      
+        // Define food component words that should be preserved as distinct ite
+        const preserveDistinctComponents = ['egg', 'bacon', 'sausage', 'beans', 'tomato', 'mushroom'
+                                         'toast', 'bread', 'chicken', 'beef', 'rice', 'potato', 'cheese'
+      
+        // Check if this label is a unique food component that should be preserv
+        let isDistinctComponent = preserveDistinctComponents.some(component =
+          lowerLabel === component || lowerLabel.startsWith(component + ' ') || lowerLabel.endsWith(' ' + componen
+        
+      
+        // Only check for similarity if not a distinct compone
+        if (!isDistinctComponent)
+          for (const existingLabel of uniqueLabelTexts)
+            // Only consider as duplicate if it's a complete subset or very high overlap rat
+            // Calculate similarity using word overlap rather than string inclusi
+            const labelWords = new Set(lowerLabel.split(' ')
+            const existingWords = new Set(existingLabel.split(' ')
+          
+            // Skip single word comparisons for common foods (they're importan
+            if (labelWords.size === 1 && existingWords.size === 1 &
+                preserveDistinctComponents.includes(lowerLabel))
+              continu
+           
+          
+            // For short labels, strict similarity checki
+            if (lowerLabel.length < 10 || existingLabel.length < 10)
+              if (lowerLabel === existingLabel)
+                tooSimilar = tru
+                brea
+             
+              continue; // Skip further checks for short labe
+           
+          
+            // For longer labels, check overlap percenta
+            const intersection = new Set([...labelWords].filter(x => existingWords.has(x))
+            const unionSize = new Set([...labelWords, ...existingWords]).siz
+            const overlapRatio = intersection.size / unionSiz
+          
+            // Only consider similar if high overlap ratio (80%
+            if (overlapRatio > 0.8)
+              tooSimilar = tru
+              brea
+           
+         
+       
+      
+        if (!tooSimilar)
+          uniqueLabels.push(item
+          uniqueLabelTexts.add(lowerLabel
+          // Log what we're keeping for better debuggi
+          logger.debug(`Keeping unique food label: ${item.label} (score: ${item.combinedScore.toFixed(2)})`
+        } else
+          logger.debug(`Filtered out similar label: ${item.label}`
+       
+     
+    
+      // Extract final filtered labe
+      const filteredFoodLabels = uniqueLabels.map(item => item.label
+    
+      // Log for debuggi
+      logger.info('Scored and filtered food labels:'
+                  uniqueLabels.map(l => `${l.label} (score: ${l.combinedScore.toFixed(2)})`).join(', ')
+      // Decision Log
+      // A. Plated meal detected (multiple food labels, no barcode or ignore barcode in meal contex
+      // ... (rest of the code remains the sam
+          // For example: if we see "Rice" and "Chicken", add "Chicken Rice" and "Chicken with Ric
+          // This helps with dishes that have a specific name when combin
+          // Limit combinations to reduce memory usa
+          const maxCombinations = 3; // Only create combinations for first few labe
+          for (let i = 0; i < Math.min(maxCombinations, priorityFoodLabels.length); i++)
+          // We already have a well-filtered and prioritized list from our new scoring syst
+        const priorityFoodLabels = [...filteredFoodLabels]; // Use the scored and filtered food labe
+      
+        // Add detection confidence lo
+        if (priorityFoodLabels.length > 0)
+          logger.info(`Detected food items in priority order: ${priorityFoodLabels.join(', ')}`
+        
+          // Find our top-ranked item for enhanced nutrition look
+          const topLabel = priorityFoodLabels[0
+          logger.info(`Primary detected item: ${topLabel}`);
+        } else
+          logger.warn('No food items detected from image.');
+       
+        // Log for API nutrition look
+        logger.info('Priority food labels for nutrition lookup:', priorityFoodLabels
+      
+        // Use Promise.all to fetch nutrition data in parallel rather than sequential
+        // Limit to top 4 labels to reduce memory usage but ensure adequate covera
+        const limitedLabels = priorityFoodLabels.slice(0, 4
+      
+        const nutritionResults = await Promise.al
+          limitedLabels.map(async (label) =>
+            try
+              // Set timeouts for API calls to avoid hangi
+              // ... (rest of the code remains the sam
+        if (usdaNutrition) sources.push('USDA'
+        if (offNutrition) sources.push('OFF'
+        if (fatSecretNutrition) sources.push('FatSecret'
+        if (usdaNutrition || offNutrition || fatSecretNutrition)
+        // Prefer most specific name: OFF > FatSecret > USDA > lab
+        let ingredientName = offNutrition?.foodName || fatSecretNutrition?.foodName || usdaNutrition?.foodName || labe
+      
+        // Clean up ingredient name for better displ
+        ingredientName = cleanIngredientName(ingredientName
+      
+        // Enhance ingredient name with cooking method if detect
+        if (ingredientName.toLowerCase().includes('egg') &
+            !ingredientName.toLowerCase().includes('fried') &
+            labelAnnotations.some(l => l.description.toLowerCase().includes('fried')))
+          ingredientName = 'Fried ' + ingredientNam
+       
+      
+        // More specific naming for sausage typ
+        if (ingredientName.toLowerCase() === 'sausage' &
+            filteredFoodLabels.some(l => l.toLowerCase().includes('breakfast')))
+          ingredientName = 'Breakfast Sausage
+       
+      
+        // Compose user message for partial da
+        let message = nul
+        if (!usdaNutrition && !offNutrition && !fatSecretNutrition)
+          message = 'No nutrition data found for this item.
+        } else
+          // Determine which sources we ha
+          const availableSources = [
+          if (usdaNutrition) availableSources.push('USDA'
+          if (offNutrition) availableSources.push('OFF'
+          if (fatSecretNutrition) availableSources.push('FatSecret'
+        
+          // Enhanced messaging based on data source quali
+          if (availableSources.length === 1)
+            const source = availableSources[0
+            if (source === 'FatSecret')
+              message = 'Nutrition data from FatSecret food database.
+            } else if (source === 'OFF')
+              message = 'Nutrition data from Open Food Facts community database.
+            } else
+              message = 'Nutrition data from USDA food database.
+           
+          } else
+            // Check for missing macros/micr
+            if (!usdaNutrition?.protein || !usdaNutrition?.carbohydrates)
+              message = 'Some nutrition data may be incomplete (missing macros).
+            } else if (!usdaNutrition?.sodium || !usdaNutrition?.potassium)
+              message = 'Some micronutrient data may be incomplete.
+            } else
+              message = `Nutrition data verified from ${availableSources.length} sources.
+           
+         
+       
+      
+        // New helper function to clean up ingredient nam
+        function cleanUpIngredientName(name)
+          // Convert to title case for consisten
+          name = name.split(' 
+            .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase(
+            .join(' '
+        
+          // Remove generic prefixes like "Raw" or "Cooked" if they're redundant with detecti
+          const prefixesToClean = ['Raw ', 'Cooked ', 'Frozen ', 'Canned '
+          for (const prefix of prefixesToClean)
+            if (name.startsWith(prefix) && name.length > prefix.length + 3)
+              name = name.substring(prefix.length
+              brea
+           
+         
+        
+          // Add specific descriptive details based on food ty
+          if (name.toLowerCase().includes('egg') && !name.toLowerCase().includes('fried') &
+              labelAnnotations.some(l => l.description.toLowerCase().includes('fried')))
+            name = 'Fried ' + nam
+         
+        
+          return nam
+       
+        
+        // Use the best data we have, prioritizing OFF > FatSecret > US
+        let mergedNutritio
+        if (offNutrition)
+          mergedNutrition = { ...offNutrition, source: 'Open Food Facts' 
+        } else if (fatSecretNutrition)
+          mergedNutrition = { ...fatSecretNutrition, source: 'FatSecret' 
+        } else if (usdaNutrition)
+          mergedNutrition = { ...usdaNutrition, source: 'USDA' 
+       
+      
+        // Fill in any missing da
+        if (mergedNutrition)
+          try
+            // If we're missing protein from primary source but have it from anoth
+            if (!mergedNutrition.protein)
+              if (fatSecretNutrition?.protein)
+                mergedNutrition.protein = fatSecretNutrition.protei
+              } else if (usdaNutrition?.protein)
+                mergedNutrition.protein = usdaNutrition.protei
+             
+           
+          
+            // If we're missing carbs from primary source but have it from anoth
+            if (!mergedNutrition.carbohydrates)
+              if (fatSecretNutrition?.carbohydrates)
+                mergedNutrition.carbohydrates = fatSecretNutrition.carbohydrate
+              } else if (usdaNutrition?.carbohydrates)
+                mergedNutrition.carbohydrates = usdaNutrition.carbohydrate
+             
+           
+          
+            // If we're missing fat from primary source but have it from anoth
+            if (!mergedNutrition.fat)
+              if (fatSecretNutrition?.fat)
+                mergedNutrition.fat = fatSecretNutrition.fa
+              } else if (usdaNutrition?.fat)
+                mergedNutrition.fat = usdaNutrition.fa
+             
+           
+          
+            // Add any micronutrients from USDA that may be missi
+            if (usdaNutrition?.microNutrients && (!mergedNutrition.microNutrients || Object.keys(mergedNutrition.microNutrients).length === 0))
+              mergedNutrition.microNutrients = usdaNutrition.microNutrient
+           
+          } catch (mergeError)
+            logger.error('Error during nutrition data merging:', mergeError
+            // Use what we have, even if incomple
+         
+        
+          // Add sources in
+          if (sources && sources.length > 0)
+            mergedNutrition.sources = source
+         
+        
+          // If there are any explicitly added properties, remove th
+          if (mergedNutrition.source) delete mergedNutrition.sourc
+        
+          // Add the ingredient to our li
+          ingredients.push
+            name: ingredientNam
+            nutrition: mergedNutritio
+            message: messag
+            amount: 
+            unit: 'servin
+          }
+          anyFound = tru
+       
+      
+        // Calculate meal totals if ingredients were fou
+        if (ingredients.length > 0)
+          // Basic summation for portion size or meal composition analys
+          totals =
+            calories: 
+            protein: 
+            carbohydrates: 
+            fat: 
+            fiber: 
+            sugar: 
+            sodium: 
+            potassium:
+          
+        
+          // Process enhanced results from L
+          if (enhancedResults && enhancedResults.ingredients)
+            logger.info('Processed LLM enhanced ingredients:'
+              enhancedResults.ingredients.map(i => i.name).join(', ')
+          
+            // Check for English breakfast in the raw labe
+            const hasEnglishBreakfastLabel = labelDescriptions.some(label =
+              label.toLowerCase().includes('english breakfast') |
+              label.toLowerCase().includes('full breakfast
+            
+          
+            // Check for multiple breakfast components in labe
+            const breakfastItems = ['egg', 'sausage', 'bacon', 'bean', 'tomato', 'toast', 'mushroom'
+            const detectedBreakfastComponents = labelDescriptions.filter(label =
+              breakfastItems.some(item => label.toLowerCase().includes(item
+            
+          
+            // Log what breakfast items were detected in Vision A
+            if (detectedBreakfastComponents.length > 0)
+              logger.info('Detected breakfast components in Vision API:', detectedBreakfastComponents.join(', ')
+           
+          
+            // Special handling for English breakfast and other multi-component mea
+            const isLikelyEnglishBreakfast 
+              hasEnglishBreakfastLabel |
+              detectedBreakfastComponents.length >= 2 |
+              mealType.toLowerCase().includes('english breakfast') |
+              mealType.toLowerCase().includes('full breakfast') 
+              enhancedResults.description?.toLowerCase().includes('english breakfast'
+          
+            // CRITICAL FIX: Force multi-component detection even if Vision API and LLM don't detect it proper
+            // This is a fundamental fix for the food detection probl
+            const forceMultiComponentDetection =
+              // Either we have multiple breakfast items detect
+              detectedBreakfastComponents.length >= 2 
+              // Or we see specific combinations that strongly indicate a multi-component me
+              (detectedBreakfastComponents.length > 0 &
+                (labelDescriptions.some(l => l.toLowerCase().includes('breakfast')) 
+                 labelDescriptions.some(l => l.toLowerCase().includes('meal')) 
+                 labelDescriptions.some(l => l.toLowerCase().includes('dish')) 
+                 labelDescriptions.some(l => l.toLowerCase().includes('platter'))
+            
+          
+            // Force multi-component handling for English breakfast or any detected multi-component me
+            if (isLikelyEnglishBreakfast || forceMultiComponentDetection)
+              logger.info('MULTI-COMPONENT MEAL DETECTED - will identify all distinct food items'
+            
+              // Extract vision components as fallba
+              const visionComponents = new Set(
+              for (const label of labelDescriptions)
+                // Extract clean food components from vision labe
+                for (const item of breakfastItems)
+                  if (label.toLowerCase().includes(item))
+                    // Construct a cleaner component na
+                    let componentName = labe
+                    if (item === 'egg')
+                      componentName = label.toLowerCase().includes('fried') ? 'Fried Eggs' : 'Eggs
+                    } else if (item === 'sausage')
+                      componentName = 'Sausages
+                    } else if (item === 'bacon')
+                      componentName = 'Bacon
+                    } else if (item === 'bean')
+                      componentName = 'Baked Beans
+                    } else if (item === 'tomato')
+                      componentName = 'Tomatoes
+                    } else if (item === 'toast' || item === 'bread')
+                      componentName = 'Toast
+                    } else if (item === 'mushroom')
+                      componentName = 'Mushrooms
+                   
+                    visionComponents.add(componentName
+                 
+               
+             
+            
+              // CRITICAL FIX: If LLM returned fewer items than what Vision API detect
+              // (this is the key issue - the LLM is missing component
+              const visionComponentsArray = Array.from(visionComponents
+              if (enhancedResults.ingredients.length < visionComponentsArray.length)
+                logger.warn(`LLM missed components detected by Vision API. `
+                           `LLM has ${enhancedResults.ingredients.length} items, `
+                           `Vision API detected ${visionComponentsArray.length} items.`
+              
+                // Add missing components from Vision API to the LLM resul
+                const currentComponents = new Set(enhancedResults.ingredients.map(i =
+                  i.name.toLowerCase().replace(/\s+\([^)]+\)$/, '') // Remove quantities in parenthes
+                )
+              
+                // Add any vision components not already in the LLM resul
+                for (const component of visionComponentsArray)
+                  if (!currentComponents.has(component.toLowerCase()))
+                    enhancedResults.ingredients.push(
+                      name: component
+                      addedFromVisionAPI: tru
+                    }
+                    logger.info(`Added missing component from Vision API: ${component}`
+                 
+               
+             
+            
+              // If we still have only one ingredient (or none) for something that's likely an English breakfa
+              // Use default components as a fallba
+              if (enhancedResults.ingredients.length <= 1 && isLikelyEnglishBreakfast)
+                logger.warn('Still only found one component for English breakfast. Creating standard components.'
+                // Create standard English breakfast components as a fallba
+                const standardComponents =
+                  { name: 'Fried Eggs (2)', addedByLLM: true 
+                  { name: 'Pork Sausages (2)', addedByLLM: true 
+                  { name: 'Bacon Rashers (2)', addedByLLM: true 
+                  { name: 'Baked Beans (portion)', addedByLLM: true 
+                  { name: 'Grilled Tomatoes (2)', addedByLLM: true 
+                  { name: 'Toast (2 slices)', addedByLLM: true
+                
+              
+                enhancedResults.ingredients = standardComponent
+                logger.info('Created standard English breakfast components as fallback'
+             
+            
+              try
+                // For English breakfast, ensure we keep all components as separate ite
+                // and look up nutrition data for each component individual
+                const componentsWithNutrition = await Promise.al
+                  enhancedResults.ingredients.map(async (ingredient) =>
+                    // Skip additional lookup if we already have nutrition da
+                    if (ingredient.nutrition)
+                      return ingredien
+                   
+                  
+                    // Look up nutrition data for this specific compone
+                    logger.info(`Looking up nutrition for ${ingredient.name}`
+                    const componentName = ingredient.name.replace(/\s+\([^)]+\)$/, ''); // Remove quantity in parenthes
+                  
+                    // Try each nutrition API in parall
+                    const [usdaNutrition, offNutrition, fatSecretNutrition] = await Promise.all
+                      getNutritionFromUSDA(componentName).catch(err =>
+                        logger.warn(`USDA nutrition lookup failed for ${componentName}:`, err.message
+                        return nul
+                      }
+                      getNutritionFromOFF(componentName).catch(err =>
+                        logger.warn(`OFF nutrition lookup failed for ${componentName}:`, err.message
+                        return nul
+                      }
+                      getNutritionFromFatSecret(componentName).catch(err =>
+                        logger.warn(`FatSecret nutrition lookup failed for ${componentName}:`, err.message
+                        return nul
+                      
+                    ]
+                  
+                    // Pick the best nutrition sour
+                    let mergedNutrition = nul
+                    const sources = [
+                  
+                    if (offNutrition)
+                      mergedNutrition = { ...offNutrition 
+                      sources.push('OFF'
+                    } else if (fatSecretNutrition)
+                      mergedNutrition = { ...fatSecretNutrition 
+                      sources.push('FatSecret'
+                    } else if (usdaNutrition)
+                      mergedNutrition = { ...usdaNutrition 
+                      sources.push('USDA'
+                   
+                  
+                    // If we couldn't find nutrition data, create simple default valu
+                    if (!mergedNutrition)
+                      mergedNutrition =
+                        calories: componentName.toLowerCase().includes('egg') ? 70 
+                                  componentName.toLowerCase().includes('sausage') ? 150
+                                  componentName.toLowerCase().includes('bacon') ? 120
+                                  componentName.toLowerCase().includes('bean') ? 140
+                                  componentName.toLowerCase().includes('tomato') ? 25
+                                  componentName.toLowerCase().includes('toast') ? 80 : 10
+                        protein: componentName.toLowerCase().includes('egg') ? 6 
+                                 componentName.toLowerCase().includes('sausage') ? 8
+                                 componentName.toLowerCase().includes('bacon') ? 10
+                                 componentName.toLowerCase().includes('bean') ? 5 : 
+                        carbohydrates: componentName.toLowerCase().includes('bean') ? 25
+                                       componentName.toLowerCase().includes('toast') ? 15 : 
+                        fat: componentName.toLowerCase().includes('egg') ? 5 
+                             componentName.toLowerCase().includes('sausage') ? 12
+                             componentName.toLowerCase().includes('bacon') ? 8 : 
+                        fiber: componentName.toLowerCase().includes('bean') ? 8 : 
+                        sugar: componentName.toLowerCase().includes('bean') ? 5 : 
+                        sodium: componentName.toLowerCase().includes('bacon') ? 400
+                                componentName.toLowerCase().includes('sausage') ? 350 : 5
+                        potassium: componentName.toLowerCase().includes('bean') ? 400 : 1
+                      
+                      sources.push('Default');
+                   
+                  
+                    // Add sources info if we have nutrition da
+                    if (mergedNutrition && sources.length > 0)
+                      mergedNutrition.sources = source
+                   
+                  
+                    return
+                      ...ingredien
+                      nutrition: mergedNutritio
+                      message: sources.includes('Default')
+                        `Estimated nutrition data for ${componentName}`
+                        `Nutrition data found for ${componentName
+                    
+                  
+                
+              
+                // Replace the ingredients array with our enhanced versi
+                ingredients = componentsWithNutritio
+                logger.info(`Multi-component meal with ${ingredients.length} individual items processed`
+              
+                // Update meal type if it's an English breakfa
+                if (isLikelyEnglishBreakfast)
+                  mealType = 'English Breakfast
+               
+              } catch (error)
+                // Log the error but continue with the original ingredien
+                logger.error('Error processing multi-component meal:', error
+                // Use the standard LLM enhanced ingredien
+                ingredients = enhancedResults.ingredient
+             
+            } else if (enhancedResults.ingredients.length > 1)
+              // For other multi-component meals, use the enhanced ingredients as-
+              logger.info('Multi-component meal detected - preserving all components'
+              ingredients = enhancedResults.ingredient
+            } else
+              // For other meals, use the standard LLM enhanced ingredien
+              ingredients = enhancedResults.ingredient
+           
+          
+            description = enhancedResults.description || descriptio
+          
+            // Update the meal classification if we got more specific informati
+            if (enhancedResults.description &
+                (mealType === 'Unknown' || mealType === 'Meal') &
+                detectCommonMealTypes(enhancedResults.description) !== 'Unknown')
+              mealType = detectCommonMealTypes(enhancedResults.description
+           
+         
+        
+          ingredients.forEach(ingredient =>
+            if (ingredient.nutrition)
+              const { nutrition } = ingredien
+              totals.calories += nutrition.calories || 
+              totals.protein += nutrition.protein || 
+              totals.carbohydrates += nutrition.carbohydrates || 
+              totals.fat += nutrition.fat || 
+              totals.fiber += nutrition.fiber || 
+              totals.sugar += nutrition.sugar || 
+              totals.sodium += nutrition.sodium || 
+              totals.potassium += nutrition.potassium || 
+           
+          }
+        
+          // Create flat versions of all ingredients for iOS compatibility with consistent number typ
+          const flatIngredients = ingredients.map(ingredient => 
+            ...ingredien
+            nutrition:
+              calories: Number(ingredient.nutrition?.calories || 0
+              protein: Number(ingredient.nutrition?.protein || 0
+              carbohydrates: Number(ingredient.nutrition?.carbohydrates || 0
+              fat: Number(ingredient.nutrition?.fat || 0
+              fiber: Number(ingredient.nutrition?.fiber || 0
+              sugar: Number(ingredient.nutrition?.sugar || 0
+              sodium: Number(ingredient.nutrition?.sodium || 0
+              potassium: Number(ingredient.nutrition?.potassium || 
+           
+          })
+        
+          // Ensure we have default values for any potentially missing properti
+          // And ensure all values are explicitly converted to numbers for iOS type safe
+          const flatTotals =
+            calories: Number(totals.calories || 0
+            protein: Number(totals.protein || 0
+            carbohydrates: Number(totals.carbohydrates || 0
+            fat: Number(totals.fat || 0
+            fiber: Number(totals.fiber || 0
+            sugar: Number(totals.sugar || 0
+            sodium: Number(totals.sodium || 0
+            potassium: Number(totals.potassium || 
+          
+
+          // Return the resu
+          const responseObj =
+            success: tru
+            mealId: mealI
+            mealName: mealNam
+            ingredients: flatIngredient
+            labels: filteredFoodLabels || [
+            mealType: mealTyp
+            // Use flat primitive types for iOS compatibility (avoid nested object
+            // Explicitly convert to number to ensure type consistency for i
+            calories: Number(flatTotals.calories
+            protein: Number(flatTotals.protein
+            carbohydrates: Number(flatTotals.carbohydrates
+            fat: Number(flatTotals.fat
+            fiber: Number(flatTotals.fiber
+            sugar: Number(flatTotals.sugar
+            sodium: Number(flatTotals.sodium
+            potassium: Number(flatTotals.potassium
+            description: description || nul
+            nutritionNotes: enhancedResults?.nutritionNotes || nul
+            missingItems: enhancedResults?.missingItems || [
+            barcodes: 
+          
+        
+          // Log the final response structure for debugging (omit large arrays for clarit
+          const responseSummary =
+            ...responseOb
+            ingredients: `[${responseObj.ingredients.length} items]
+            labels: `[${responseObj.labels.length} items
+          
+          logger.info(`Final response structure: ${JSON.stringify(responseSummary)}`
+        
+          // Verify response structure for iOS app compatibili
+          const requiredFields = ['calories', 'protein', 'carbohydrates', 'fat', 'fiber', 'sugar', 'sodium', 'potassium'
+          const missingFields = requiredFields.filter(field => responseObj[field] === undefined
+      
+          if (missingFields.length > 0)
+            logger.warn(`WARNING: Response missing fields that iOS app may expect: ${missingFields.join(', ')}`
+         
+        
+          // Return the validated respon
+          return responseOb
+        } else
+          // No ingredients found, return a basic error respon
+          logger.warn('No nutrition data found for any detected items.'
+          return
+            success: fals
+            error: 'No nutrition data found for detected items
+            labels: filteredFoodLabels || 
+          
+       
+     
+    } catch (error)
+      // Enhanced error logging with more conte
+      logger.error('Error during image analysis:',
+        errorMessage: error.messag
+        errorName: error.nam
+        errorStack: error.stac
+        errorCode: error.code || 'unknown
+        stage: error.stage || 'unknown' // Custom property we can set in various plac
+      }
+    
+      // Send a more descriptive error message to the clie
+      let clientErrorMessage = 'Error processing image analysis.
+    
+      // Add more specific messages based on error ty
+      if (error.message.includes('labelAnnotations'))
+        clientErrorMessage = 'Error processing vision labels. Vision API may have returned unexpected format.
+      } else if (error.message.includes('nutrition'))
+        clientErrorMessage = 'Error processing nutrition data. Please try again with a clearer food image.
+      } else if (error.message.includes('timeout'))
+        clientErrorMessage = 'Nutrition API request timed out. Please try again.
+     
+    
+      throw new functions.https.HttpsError('internal', clientErrorMessage,
+        originalError: error.messag
+        timestamp: new Date().toISOString(
+        suggestedAction: 'Please try again with a clearer food imag
+      }
+   
+  
+
+// Helper function to get a food scan result from Firesto
+function getFoodScanResult(userId, scanId)
+  try
+    // Return the requested scan resu
+    return admin.firestore().collection('users').doc(userI
+      .collection('foodScans').doc(scanI
+      .get
+      .then(doc =>
+        if (doc.exists)
+          return { success: true, data: doc.data() 
+        } else
+          return { success: false, error: 'Scan not found.' 
+       
+      }
+  } catch (error)
+    logger.error(`Error retrieving food scan ${scanId}:`, error
+    return { success: false, error: 'Failed to retrieve scan result.' 
+ 
+
+// Get food scan result functionali
+exports.getFoodScanResult = onCal
+ 
+    enforceAppCheck: true, // Enforce App Check (Recommende
+  
+  async (request) =>
+    try
+      // Destructure data and auth from request (2nd-gen signatur
+      const { data, auth } = reques
+    
+      // --- Add Logging Here -
+      logger.info("getFoodScanResult called."
+      logger.info("Function auth:", !!auth); // Log Auth conte
+      logger.info("Received data:", data
+      // --- End Logging -
+      // App Check verification happens before this point due to enforceAppCheck: tr
+      if (!auth)
+        logger.error("Authentication check failed in getFoodScanResult: auth is null or undefined."
+        throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated to get scan results.'
+     
+      const userId = auth.ui
+      const { scanId } = dat
+      if (!scanId)
+        logger.warn("Missing scanId in getFoodScanResult request.", { userId: userId }
+        throw new functions.https.HttpsError('invalid-argument', 'Scan ID is required'
+     
+      logger.info(`Fetching scan result for ID: ${scanId}`, { userId: userId }
+      const scanResult = await getFoodScanResult(userId, scanId
+      return scanResul
+    } catch (error)
+      logger.error(`Error getting food scan result:`,
+          errorMessage: error.messag
+          errorStack: error.sta
+      }
+      if (error instanceof functions.https.HttpsError)
+        // Re-throw HttpsError direct
+        throw erro
+      } else
+        // Throw a generic internal err
+        throw new functions.https.HttpsError('internal', 'An internal error occurred while fetching the scan result.'
+     
+   
+ 
+
+// Start server if this file is run directly (Cloud Run entrypoin
+if (require.main === module)
+  try
+    const express = require('express'
+    const cors = require('cors'
+    const app = express(
+    app.use(cors()
+    app.use(express.json()
+    // Health check rou
+    }
+
+    // Helper function to get a food scan result from Firestore
+    function getFoodScanResult(userId, scanId) {
+      try {
+        // Return the requested scan result
+        return admin.firestore().collection('users').doc(userId)
+          .collection('foodScans').doc(scanId)
+          .get()
+          .then(doc => {
+            if (doc.exists) {
+              return { success: true, data: doc.data() };
+            } else {
+              return { success: false, error: 'Scan not found.' };
+            }
+          });
+      } catch (error) {
+        logger.error(`Error retrieving food scan ${scanId}:`, error);
+        return { success: false, error: 'Failed to retrieve scan result.' };
+      }
+    }
+
+    // Get food scan result functionality
+    exports.getFoodScanResult = onCall({
+      enforceAppCheck: true, // Enforce App Check (Recommended)
+    }, async (request) => {
+      try {
+        // Destructure data and auth from request (2nd-gen signature)
+        const { data, auth } = request;
+
+        // --- Add Logging Here ---
+        logger.info("getFoodScanResult called.");
+        logger.info("Function auth:", !!auth); // Log Auth content
+        logger.info("Received data:", data);
+        // --- End Logging ---
+
+        // App Check verification happens before this point due to enforceAppCheck: true
+        if (!auth) {
+          logger.error("Authentication check failed in getFoodScanResult: auth is null or undefined.");
+          throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated to get scan results.');
+        }
+
+        const userId = auth.uid;
+        const { scanId } = data;
+        if (!scanId) {
+          logger.warn("Missing scanId in getFoodScanResult request.", { userId: userId });
+          throw new functions.https.HttpsError('invalid-argument', 'Scan ID is required');
+        }
+
+        logger.info(`Fetching scan result for ID: ${scanId}`, { userId: userId });
+        const scanResult = await getFoodScanResult(userId, scanId);
+        return scanResult;
+      } catch (error) {
+        logger.error(`Error getting food scan result:`, {
+          errorMessage: error.message,
+          errorStack: error.stack,
+        });
+        if (error instanceof functions.https.HttpsError) {
+          // Re-throw HttpsError directly
+          throw error;
+        } else {
+          // Throw a generic internal error
+          throw new functions.https.HttpsError('internal', 'An internal error occurred while fetching the scan result.');
+        }
+      }
+    });
+
+    // Start server if this file is run directly (Cloud Run entry point)
+    if (require.main === module) {
+      try {
+        const express = require('express');
+        const cors = require('cors');
+        const app = express();
+        app.use(cors());
+        app.use(express.json());
+
+        // Health check route
+        app.get('/', (req, res) => {
+          console.log('Health check called on root path');
+          res.status(200).send('OK');
+        });
+
+        // Simple handler that returns success for any request to make Cloud Run happy
+        app.all('*', (req, res) => {
+          console.log(`Received request at ${req.path}`);
+          try {
+            res.status(200).send('OK');
+          } catch (error) {
+            console.error('Error handling request:', error);
+            res.status(500).send('Internal Server Error');
+          }
+        });
+
+        const port = process.env.PORT || 8080;
+        app.listen(port, () => {
+          console.log(`Server running on port ${port}`);
+        });
+      } catch (error) {
+        console.error('Error starting server:', error);
+      }
+    }

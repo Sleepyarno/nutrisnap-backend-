@@ -1,0 +1,41 @@
+// Updated learn_getFeaturedArticles function that doesn't require a compound index
+exports.learn_getFeaturedArticles = functions.https.onCall(async (data) => {
+  // Properly handle null data
+  const limit = data && data.limit ? data.limit : 3; // Default to 3 featured articles
+  
+  try {
+    // Get all articles first, then filter in memory instead of using a compound query
+    const snapshot = await articlesCollection.get();
+    
+    // Filter featured articles in memory and sort by publicationDate
+    let featuredArticles = [];
+    snapshot.forEach(doc => {
+      const articleData = doc.data();
+      if (articleData.isFeatured === true) {
+        featuredArticles.push({
+          id: doc.id,
+          ...articleData
+        });
+      }
+    });
+    
+    // Sort by publicationDate (newest first)
+    featuredArticles.sort((a, b) => {
+      const dateA = a.publicationDate ? new Date(a.publicationDate) : new Date(0);
+      const dateB = b.publicationDate ? new Date(b.publicationDate) : new Date(0);
+      return dateB - dateA;
+    });
+    
+    // Apply limit
+    featuredArticles = featuredArticles.slice(0, limit);
+    
+    return { articles: featuredArticles };
+  } catch (error) {
+    console.error('Error fetching featured articles:', error);
+    throw new functions.https.HttpsError(
+      'internal',
+      'An error occurred while fetching featured articles.',
+      error
+    );
+  }
+});

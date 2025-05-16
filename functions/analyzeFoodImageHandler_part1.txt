@@ -1,0 +1,556 @@
+async function analyzeFoodImageHandler(request) {
+    console.log("analyzeFoodImage function called");
+
+    // Destructure data and auth from request (2nd-gen signature)
+    const { data, auth } = request;
+    console.log("Auth present:", !!auth);
+    console.log("Data contains image URL:", !!data?.imageUrl);
+
+    // Enforce authentication via Firebase Auth
+    if (!auth) {
+      console.error("No authentication provided to analyzeFoodImage");
+      throw new HttpsError(
+        'unauthenticated',
+        'The function must be called while authenticated.'
+      );
+    }
+    console.log("User is authenticated via Firebase Auth:", auth.uid);
+
+    // The image URL is required
+    const imageUrl = data.imageUrl;
+    if (!imageUrl) {
+      throw new HttpsError(
+        'invalid-argument',
+        'Missing image URL'
+      );
+    }
+    // Process the image and return results
+    try {
+      // Extract image name from URL to use as meal ID (consistent with iOS app)
+let mealId;
+if (data.mealId) {
+  mealId = data.mealId;
+} else {
+  // Try to extract the image name from the URL which is typically a UUID
+  // Extract filename from Firebase Storage URL
+  const storageUrlPattern = /images%2F([\w-]+)\.(jpg|jpeg|png)/i;
+  const match = imageUrl.match(storageUrlPattern);
+  
+  if (match && match[1]) {
+    // Use the image filename without extension as mealId
+    mealId = match[1];
+    logger.info(`Extracted image filename as mealId: ${mealId}`);
+  } else {
+    // Fallback to Firestore generated ID
+    mealId = admin.firestore().collection('meals').doc().id;
+    logger.info(`Generated Firestore ID for mealId: ${mealId}`);
+  }
+}
+      logger.info("Starting real image analysis for imageUrl: " + imageUrl, { userId: auth.uid, mealId });
+      const visionClient = await getVisionClient();
+      // Download image as buffer
+      const fetch = require('node-fetch'); // Used for both OFF and USDA requests
+      const response = await fetch(imageUrl);
+      if (!response.ok) {
+        throw new HttpsError('invalid-argument', 'Unable to download image from provided URL.');
+      }
+      const imageBuffer = await response.buffer();
+
+      // Run Vision API with both LABEL_DETECTION and OBJECT_LOCALIZATION
+      const [visionResponse] = await visionClient.annotateImage({
+        image: { content: imageBuffer },
+        features: [
+          { type: 'LABEL_DETECTION', maxResults: 15 },
+          { type: 'OBJECT_LOCALIZATION', maxResults: 10 },
+          // Add PRODUCT_SEARCH or TEXT_DETECTION here if needed
+        ],
+      });
+      const visionLabels = visionResponse.labelAnnotations || [];
+logger.info('Raw Vision API labelAnnotations:', JSON.stringify(visionLabels, null, 2));
+      const localizedObjects = visionResponse.localizedObjectAnnotations || [];
+logger.info('Raw Vision API localizedObjectAnnotations:', JSON.stringify(localizedObjects, null, 2));
+      logger.info('Vision API labels:', visionLabels.map(l => l.description));
+      logger.info('Vision API object localizations:', localizedObjects.map(o => `${o.name} (${o.score})`));
+
+      // Function to check if a label describes a food item
+      function isFoodItem(description) {
+        const foodKeywords = [
+          // General food terms
+          'food', 'meal', 'breakfast', 'lunch', 'dinner', 'snack', 'dish',
+          'cuisine', 'plate', 'bowl', 'dining',
+          
+          // Food categories
+          'fruit', 'vegetable', 'meat', 'fish', 'grain', 'cereal', 'nut', 'seed',
+          'pasta', 'salad', 'soup', 'sandwich', 'burger', 'pizza', 'beverage',
+          'drink', 'ingredient', 'dairy', 'cheese', 'egg', 'eggs', 'poultry', 'seafood',
+          
+          // Breakfast specific items
+          'bacon', 'sausage', 'sausages', 'beans', 'baked beans', 'toast', 'mushroom', 'mushrooms',
+          'tomato', 'tomatoes', 'hash brown', 'hash browns', 'black pudding', 'full english', 'english breakfast',
+          'ham', 'bread', 'potato', 'potatoes',
+          
+          // Common food preparations
+          'fried', 'grilled', 'baked', 'boiled', 'scrambled', 'sunny side up', 'over easy',
+          'roasted', 'steamed', 'poached', 'barbecued', 'stewed', 'toasted',
+          
+          // Common ingredients
+          'butter', 'oil', 'sauce', 'mayonnaise', 'ketchup', 'syrup', 'jam', 'spread',
+          'sugar', 'salt', 'pepper', 'spice', 'herb'
+        ];
+        
+        // Check if the description contains any of the keywords
+        return foodKeywords.some(keyword => description.includes(keyword));
+      }
+
+      // Check for barcode object
+      const barcodeObj = localizedObjects.find(obj =>
+        obj.name.toLowerCase().includes('barcode') && obj.score > 0.65
+      );
+      const barcodeDetected = !!barcodeObj;
+      logger.info('Barcode detected:', barcodeDetected);
+
+      // Extract just the description strings
+      const labelDescriptions = visionLabels.map(l => l.description);
+logger.info('labelDescriptions:', labelDescriptions);
+
+      // Filter labels for food items
+      const foodLabels = labelDescriptions.filter(l => isFoodItem(l.toLowerCase()));
+logger.info("Filtered food labels:", foodLabels);
+
+      // Decision Logic
+      // A. Plated meal detected (multiple food labels, no barcode or ignore barcode in meal context)
+      if (foodLabels.length > 0 && (!barcodeDetected || !labelDescriptions.some(l => l.toLowerCase().includes('packaged')))) {
+        logger.info('Scenario A: Plated meal or food detected, aggregating all nutrition data from USDA (no OFF).');
+        try {
+          // Set up a non-food label filter for better accuracy
+          const nonFoodLabels = new Set([
+            'food', 'cuisine', 'dish', 'recipe', 'meal', 'lunch', 'dinner', 'breakfast', 'brunch',
+            'ingredient', 'produce', 'vegetables', 'snack', 'cooking', 'dessert', 'baking', 'plate', 'bowl'
+          ]);
+          let filteredFoodLabels = foodLabels
+            .filter(label => !nonFoodLabels.has(label));
+          logger.info('Labels considered for nutrition lookup:', filteredFoodLabels);
+          let ingredients = [];
+          let totals = {calories: 0, protein: 0, fat: 0, carbohydrates: 0};
+          let anyFound = false;
+          // Process only the most relevant food labels (limit to 6) to avoid timeouts
+          // Process only the most relevant food labels (limit to 6) to avoid timeouts
+          const priorityFoodLabels = filteredFoodLabels
+            .filter(label => {
+              // Prioritize specific food items over generic terms
+              return !['food', 'ingredient', 'breakfast', 'dish', 'meal', 'cooking', 'brunch'].includes(label.toLowerCase());
+            })
+            .slice(0, 6); // Increased: process up to 6 specific food items to avoid missing components
+          logger.info('Priority food labels for nutrition lookup:', priorityFoodLabels);
+          // Log before nutrition lookup
+          logger.info('Filtered food labels before nutrition lookup:', filteredFoodLabels);
+        
+        // Use Promise.all to fetch nutrition data in parallel rather than sequentially
+        const nutritionResults = await Promise.all(
+          priorityFoodLabels.map(async (label) => {
+            try {
+              // Set timeouts for API calls to avoid hanging
+              const usdaPromise = getNutritionFromUSDA(label).catch(err => {
+                logger.warn(`USDA nutrition lookup failed for '${label}':`, err);
+                return null;
+              });
+              
+              const offPromise = getNutritionFromOFF(label).catch(err => {
+                logger.warn(`OFF nutrition lookup failed for '${label}':`, err);
+                return null;
+              });
+              
+              const fatSecretPromise = fatSecretAPI.getNutritionFromFatSecret(label).catch(err => {
+                logger.warn(`FatSecret nutrition lookup failed for '${label}':`, err);
+                return null;
+              });
+              
+              // Create a timeout promise
+              const timeout = new Promise((resolve) => setTimeout(() => {
+                logger.warn(`Timeout exceeded for nutrition lookup of '${label}'`);
+                resolve({ usdaNutrition: null, offNutrition: null, fatSecretNutrition: null });
+              }, 5000));
+              
+              // Race against timeout
+              const [usdaNutrition, offNutrition, fatSecretNutrition] = await Promise.race([
+                Promise.all([usdaPromise, offPromise, fatSecretPromise]),
+                timeout.then(() => [null, null, null])
+              ]);
+              
+              logger.info(`USDA nutrition for '${label}':`, usdaNutrition);
+              logger.info(`OFF nutrition for '${label}':`, offNutrition);
+              logger.info(`FatSecret nutrition for '${label}':`, fatSecretNutrition);
+              
+              return { label, usdaNutrition, offNutrition, fatSecretNutrition };
+            } catch (error) {
+              logger.error(`Error fetching nutrition for '${label}':`, error);
+              return { label, usdaNutrition: null, offNutrition: null, fatSecretNutrition: null };
+            }
+          })
+        );
+        
+        // Use reference data if API lookup fails
+        if (nutritionResults.every(result => !result.usdaNutrition && !result.offNutrition)) {
+          logger.info('No nutrition data found via APIs. Using reference database for accurate values.');
+          
+          // Try the reference database
+          const referenceData = getReferenceNutritionData([], filteredFoodLabels);
+          
+          if (referenceData && referenceData.ingredients.length > 0) {
+            logger.info('Successfully found reference nutritional data');
+            ingredients = referenceData.ingredients;
+            totals = referenceData.totals;
+            anyFound = true;
+            
+            // Skip normal processing by setting an empty array to process
+            nutritionResults.length = 0;
+          } else {
+            // If reference database also fails, try ingredient-based calculation
+            logger.info('No reference data found. Attempting ingredient-based calculation...');
+            const calculatedData = calculateNutritionFromIngredients([], filteredFoodLabels);
+            
+            if (calculatedData) {
+              logger.info('Successfully calculated nutrition from ingredients');
+              ingredients = calculatedData.ingredients;
+              totals = calculatedData.totals;
+              anyFound = true;
+              
+              // Skip normal processing by setting an empty array to process
+              nutritionResults.length = 0;
+            }
+          }
+        }
+
+        // Process each individual nutrition result
+        for (const result of nutritionResults) {
+          const { label, usdaNutrition, offNutrition, fatSecretNutrition } = result;
+          
+          // Track sources
+          const sources = [];
+          if (usdaNutrition) sources.push('USDA');
+          if (offNutrition) sources.push('OFF');
+          if (fatSecretNutrition) sources.push('FatSecret');
+
+          if (usdaNutrition || offNutrition || fatSecretNutrition) {
+            // Prefer most specific name: OFF > FatSecret > USDA > label
+            let ingredientName = offNutrition?.foodName || fatSecretNutrition?.foodName || usdaNutrition?.foodName || label;
+            // Compose user message for partial data
+            let message = null;
+            if (!usdaNutrition && !offNutrition && !fatSecretNutrition) {
+              message = 'No nutrition data found for this item.';
+            } else {
+              // Determine which sources we have
+              const availableSources = [];
+              if (usdaNutrition) availableSources.push('USDA');
+              if (offNutrition) availableSources.push('OFF');
+              if (fatSecretNutrition) availableSources.push('FatSecret');
+              
+              if (availableSources.length === 1) {
+                message = `Nutrition data found from only one source (${availableSources[0]}).`;
+              } else {
+                // Check for missing macros/micros
+                const missingMacros = macroKeys.filter(k => macros[k].value === 0);
+                if (missingMacros.length > 0) {
+                  message = `Partial nutrition data: missing ${missingMacros.join(', ')}.`;
+                }
+              }
+            }
+            ingredients.push({
+              name: ingredientName,
+              sources,
+              macros,
+              micros,
+              ...(message ? { message } : {})
+            });
+            // Sum totals using .value fields (always numbers)
+            totals.calories += Number(macros.calories.value);
+            totals.protein += Number(macros.protein.value);
+            totals.fat += Number(macros.fat.value);
+            totals.carbohydrates += Number(macros.carbohydrates.value);
+            anyFound = true;
+          } else {
+            ingredients.push({
+              name: label,
+              sources: [],
+              macros: {},
+              micros: {},
+              message: 'No nutrition data found for this item.'
+            });
+          }
+        }
+        logger.info('Merged ingredient results (pre-LLM):', ingredients);
+logger.info('Final ingredients array before return:', ingredients);
+        logger.info('Computed totals:', totals);
+        // Create a more descriptive meal name
+        let mealName;
+        // Attempt meal classification with original and expanded labels
+        let expandedFoodLabels = [...filteredFoodLabels];
+        
+        // Add inferred breakfast-related labels if breakfast indicators are present
+        const breakfastIndicators = ['morning', 'breakfast', 'brunch', 'dawn', 'am', 'early', 'meal', 'plate', 'dish'];
+        const hasBreakfastIndicator = filteredFoodLabels.some(label => 
+          breakfastIndicators.some(indicator => label.includes(indicator))
+        );
+        
+        // Add 'english breakfast' label if breakfast indicators and typical items are present
+        const englishBreakfastItems = ['egg', 'eggs', 'sausage', 'sausages', 'bacon', 'ham', 'bean', 'beans', 'mushroom', 'mushrooms', 'tomato', 'tomatoes', 'toast', 'bread', 'hash brown', 'hash browns', 'potato'];
+        const hasEnglishBreakfastItems = ingredientNames => 
+          englishBreakfastItems.filter(item => 
+            ingredientNames.some(name => name.includes(item) || (name.includes('fried') && item === 'egg'))
+          ).length >= 1; // Lower threshold to 1 to better detect English breakfast components
+        
+        if (hasBreakfastIndicator || hasEnglishBreakfastItems(ingredients.map(i => i.name.toLowerCase()))) {
+          expandedFoodLabels.push('breakfast');
+          logger.info('Added breakfast label based on food context');
+          
+          // If multiple English breakfast items detected, add 'english breakfast' label
+          if (hasEnglishBreakfastItems(ingredients.map(i => i.name.toLowerCase()))) {
+            expandedFoodLabels.push('english breakfast');
+            logger.info('Added english breakfast label based on typical ingredients');
+          }
+        }
+        
+        if (foodLabels.length > 0) {
+          // Try to classify the meal with expanded labels
+          mealName = classifyMeal(ingredients, expandedFoodLabels);
+          
+          if (!mealName) {
+            // If classification failed, create a name from top ingredients
+            const topIngredients = ingredients
+              .filter(i => i.name) // Ensure the ingredient has a name
+              .slice(0, 2) // Take top 2
+              .map(i => i.name.charAt(0).toUpperCase() + i.name.slice(1)) // Capitalize
+              .join(' and '); // Join with 'and'
+            mealName = topIngredients ? `${topIngredients} Dish` : 'Mixed Meal';
+          }
+        } else if (foodLabels.length === 1) {
+          // Single item - use its name
+          mealName = foodLabels[0].charAt(0).toUpperCase() + foodLabels[0].slice(1);
+        } else {
+          // Fallback
+          mealName = 'Food Item';
+        }  
+        let messages = [];
+        if (!anyFound) {
+          logger.warn('No nutrition data found via USDA or OFF. Using reference database for accurate values.');
+          messages.push('Using reference nutritional database values.');
+          
+          // Look up accurate reference data based on detected ingredients
+          const referenceData = getReferenceNutritionData(detectedIngredients, labels);
+          
+          if (referenceData && referenceData.ingredients.length > 0) {
+            // Use reference data if available
+            ingredients = referenceData.ingredients;
+            totals = referenceData.totals;
+            anyFound = true;
+            logger.info(`Found reference nutrition data with ${ingredients.length} ingredients`);
+          } else {
+            // Calculate based on detected ingredients if no reference data
+            logger.info('No reference data found. Calculating from individual ingredients');
+            
+            // Calculate based on detected ingredients with component-based approach
+            const calculatedData = calculateNutritionFromIngredients(detectedIngredients, labels);
+            
+            if (calculatedData) {
+              ingredients = calculatedData.ingredients;
+              totals = calculatedData.totals;
+              anyFound = true;
+              messages.push('Nutrition calculated from ingredient components.');
+            } else {
+              // If all else fails, leave empty but don't use mock data
+              logger.warn('Unable to calculate nutrition data from ingredients');
+              messages.push('Insufficient nutrition data available for this meal.');
+              totals = {};
+              ingredients = [];
+            }
+          }
+        } else {
+          // Convert totals to simple numbers for iOS app compatibility
+          totals = {
+            calories: Number(totals.calories),
+            protein: Number(totals.protein),
+            fat: Number(totals.fat),
+            carbohydrates: Number(totals.carbohydrates)
+          };
+        }
+        // Enhance results with LLM if enabled via environment variable
+        // Check all possible ways the environment variable could be set
+        const ENABLE_LLM = process.env.ENABLE_LLM_ENHANCEMENT === 'true' || 
+                         process.env.app?.enable_llm_enhancement === 'true' ||
+                         (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test');
+        
+        logger.info(`LLM enhancement is ${ENABLE_LLM ? 'enabled' : 'disabled'}`);
+        logger.info('Meal name prior to enhancement:', mealName);
+        if (mealName === 'English Breakfast') {
+          logger.info('English Breakfast would have triggered override (but override is now disabled, merging detected components instead).');
+        }
+        
+        if (ENABLE_LLM) {
+          try {
+            logger.info('Enhancing food detection results with LLM');
+            const enhancedResults = await enhanceFoodDetection(
+              ingredients,
+              mealName,
+              filteredFoodLabels
+            );
+            
+            // Update with enhanced data
+            if (enhancedResults) {
+              logger.info('Successfully enhanced food detection with LLM');
+              // For all meals, merge detected ingredients with LLM-enhanced ones, without hardcoded override
+              let mergedIngredients = ingredients;
+              if (enhancedResults.ingredients && Array.isArray(enhancedResults.ingredients)) {
+                // Merge, preferring LLM-enhanced if not already present
+                const detectedNames = new Set(ingredients.map(i => i.name.toLowerCase()));
+                mergedIngredients = [
+                  ...ingredients,
+                  ...enhancedResults.ingredients.filter(i => !detectedNames.has(i.name.toLowerCase()))
+                ];
+              }
+              // If English Breakfast, add a note
+              if (mealName === 'English Breakfast') {
+                logger.info('English Breakfast detected: merging detected and LLM-enhanced components, not overriding.');
+                // Optionally, add a message to the analysisNotes
+                if (!enhancedResults.analysisNotes) enhancedResults.analysisNotes = [];
+                enhancedResults.analysisNotes.push('Typical English Breakfast detected. Components merged from detection and LLM.');
+              }
+              ingredients = mergedIngredients;
+              
+              // Save meal data to Firestore for glucose curve function
+              try {
+                await admin.firestore().collection('meals').doc(mealId).set({
+                  userId: auth.uid,
+                  mealName,
+                  ingredients,
+                  nutrition: {
+                    carbohydrates: { value: typeof totals.carbohydrates === 'object' ? Number(totals.carbohydrates.value) : Number(totals.carbohydrates) },
+                    protein: { value: typeof totals.protein === 'object' ? Number(totals.protein.value) : Number(totals.protein) },
+                    fat: { value: typeof totals.fat === 'object' ? Number(totals.fat.value) : Number(totals.fat) },
+                    fiber: { value: 0 } // Default to 0 if not available
+                  },
+                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                  imageUrl: imageUrl
+                });
+                logger.info(`Saved meal data to Firestore with ID: ${mealId}`);
+              } catch (error) {
+                logger.error(`Error saving meal data to Firestore: ${error.message}`);
+                // Continue processing even if save fails
+              }
+              
+              // Include description, nutrition notes, and missing items if available
+              const responseObj = {
+                success: true,
+                mealId, // Include the mealId in the response for the glucose curve
+                mealName,
+                ingredients,
+                // Ensure totals are direct numeric values for iOS compatibility
+                totals: {
+                  calories: typeof totals.calories === 'object' ? Number(totals.calories.value) : Number(totals.calories),
+                  protein: typeof totals.protein === 'object' ? Number(totals.protein.value) : Number(totals.protein),
+                  fat: typeof totals.fat === 'object' ? Number(totals.fat.value) : Number(totals.fat),
+                  carbohydrates: typeof totals.carbohydrates === 'object' ? Number(totals.carbohydrates.value) : Number(totals.carbohydrates)
+                },
+                labels: filteredFoodLabels,
+                barcodes: [],
+                messages,
+                description: enhancedResults.description || null,
+                nutritionNotes: enhancedResults.nutritionNotes || null,
+                missingItems: enhancedResults.missingItems || [],
+                analysisNotes: []
+              };
+              
+              // Add detailed analysis notes if we have missing items
+              if (enhancedResults.missingItems && enhancedResults.missingItems.length > 0) {
+                responseObj.analysisNotes.push(`This ${mealName} is missing: ${enhancedResults.missingItems.join(', ')}.`);
+              }
+              
+              // Add quantity information to ingredient names if provided
+              responseObj.ingredients = responseObj.ingredients.map(ingredient => {
+                // Look for quantity information in the verifiedIngredients
+                if (enhancedResults.verifiedIngredients) {
+                  const matchingIngredientWithQuantity = enhancedResults.verifiedIngredients.find(item => {
+                    // Remove quantity in parentheses for matching
+                    const itemName = item.replace(/\s+\([^)]+\)$/, '');
+                    return itemName.toLowerCase() === ingredient.name.toLowerCase();
+                  });
+                  
+                  if (matchingIngredientWithQuantity) {
+                    // Extract quantity if present
+                    const quantityMatch = matchingIngredientWithQuantity.match(/\(([^)]+)\)$/);
+                    if (quantityMatch) {
+                      // Add quantity info to the ingredient object
+                      return {
+                        ...ingredient,
+                        quantity: quantityMatch[1],
+                        displayName: `${ingredient.name} (${quantityMatch[1]})`
+                      };
+                    }
+                  }
+                }
+                return ingredient;
+              });
+              
+              logger.info('Merged ingredient results (post-LLM):', responseObj.ingredients);
+              logger.info('Returning LLM-enhanced response');
+              return responseObj;
+            }
+          } catch (error) {
+            // Log error but continue with original results
+            logger.error('Error enhancing food detection with LLM:', error);
+            logger.info('Continuing with unenhanced results');
+          }
+        // End of try-catch for LLM enhancement
+        
+        // Return original results if LLM enhancement is disabled or failed
+        const responseObj = {
+          success: true,
+          mealName,
+          ingredients,
+          // Ensure totals are direct numeric values for iOS compatibility
+          totals: {
+            calories: typeof totals.calories === 'object' ? Number(totals.calories.value) : Number(totals.calories),
+            protein: typeof totals.protein === 'object' ? Number(totals.protein.value) : Number(totals.protein),
+            fat: typeof totals.fat === 'object' ? Number(totals.fat.value) : Number(totals.fat),
+            carbohydrates: typeof totals.carbohydrates === 'object' ? Number(totals.carbohydrates.value) : Number(totals.carbohydrates)
+          },
+          labels: filteredFoodLabels,
+          barcodes: [],
+          messages
+        };
+        logger.info('Returning response:', JSON.stringify(responseObj, null, 2));
+        return responseObj;
+      } else if (barcodeDetected && (labelDescriptions.some(l => l.toLowerCase().includes('packaged')) || foodLabels.length <= 1)) {
+        // B. Barcode detected and context is packaged goods
+        logger.info('Scenario B: Barcode detected and context is packaged goods. Attempting OFF lookup by barcode.');
+        // Barcode value extraction stub (use OCR if needed)
+        let barcodeValue = null;
+        // Example: Try to extract barcode value from Vision API textAnnotations (if available)
+        if (visionResponse.textAnnotations && visionResponse.textAnnotations.length > 0) {
+          // This is a naive stub; real barcode OCR would be more robust
+          const possibleBarcode = visionResponse.textAnnotations[0].description.match(/\d{8,13}/);
+          if (possibleBarcode) barcodeValue = possibleBarcode[0];
+        }
+        let offNutritionResult = null;
+        if (barcodeValue) {
+          offNutritionResult = await getNutritionFromOFF(barcodeValue);
+        }
+        let barcodesArr = [];
+        if (barcodeObj) {
+          barcodesArr.push({
+            boundingBox: barcodeObj.boundingPoly,
+            confidence: barcodeObj.score,
+            barcodeValue,
+            nutrition: offNutritionResult
+          });
+        }
+        let ingredients = [];
+        if (offNutritionResult) {
+          ingredients.push({
+            name: offNutritionResult.foodName || 'Packaged Food',
+            source: 'Open Food Facts',
+            macros: {
+              calories: offNutritionResult.calories || 0,
+              protein: offNutritionResult.protein || 0,
+              fat: offNutritionResult.fat || 0,
+              carbohydrates: offNutritionResult.carbohydrates || 0
+            },

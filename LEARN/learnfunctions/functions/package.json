@@ -1,0 +1,13 @@
+{
+  "name": "nutrisnap-learn-functions",
+  "description": "Firebase Functions for the NutriSnap Learn Tab",
+  "main": "index.js",
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "firebase-admin": "^11.8.0",
+    "firebase-functions": "^4.3.1"
+  },
+  "private": true
+}

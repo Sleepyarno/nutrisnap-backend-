@@ -1,0 +1,33 @@
+/**
+ * NutriSnap Backend - Main Entry Point
+ * 
+ * This file focuses on core functionality while preserving all existing Learn functions
+ * LLM Food Detection has been restored and is working correctly.
+ */
+
+// Initialize Firebase Admin SDK
+const admin = require('firebase-admin');
+admin.initializeApp();
+
+// Import core functionality files
+const foodFunctions = require('./src/food/detection');
+const authFunctions = require('./src/auth/auth');
+const storageFunctions = require('./src/food/storage');
+const appExpress = require('./src/app'); // Main Express app
+
+// Export auth functions
+exports.createUserProfile = authFunctions.createUserProfile;
+exports.updateUserProfile = authFunctions.updateUserProfile;
+exports.getUserProfile = authFunctions.getUserProfile;
+
+// Export storage functions
+exports.getUploadUrl = storageFunctions.getUploadUrl;
+exports.processUploadedImage = storageFunctions.processUploadedImage;
+
+// Export food detection functions
+exports.analyzeFoodImage = foodFunctions.analyzeFoodImage;
+exports.getFoodScanResult = foodFunctions.getFoodScanResult;
+
+// Main API Gateway
+const functions = require('firebase-functions');
+exports.app = functions.https.onRequest(appExpress);

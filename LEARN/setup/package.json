@@ -1,0 +1,23 @@
+{
+  "name": "nutrisnap-learn-tab-setup",
+  "version": "1.0.0",
+  "description": "Setup scripts for NutriSnap Learn tab",
+  "main": "deploy.js",
+  "scripts": {
+    "seed": "node seedFirestore.js",
+    "deploy:dev": "node deploy.js dev",
+    "deploy:test": "node deploy.js test",
+    "deploy:prod": "node deploy.js prod",
+    "deploy:dev:seed": "node deploy.js dev --seed-content",
+    "deploy:test:seed": "node deploy.js test --seed-content",
+    "deploy:prod:seed": "node deploy.js prod --seed-content"
+  },
+  "author": "NutriSnap Team",
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "firebase-admin": "^11.11.1",
+    "gray-matter": "^4.0.3"
+  }
+}
