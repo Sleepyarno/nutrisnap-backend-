@@ -61,7 +61,7 @@ exports.getKnowledgeArticleBySlug = functions
         category: data.category || '',
         slug: data.slug || '',
         featured: data.featured || false,
-        publicationDate: data.publicationDate || new Date().toISOString(),
+        publicationDate: data.publicationDate && data.publicationDate.toDate ? data.publicationDate.toDate().toISOString() : new Date().toISOString(),
         imageUrl: data.imageUrl || '',
         tags: Array.isArray(data.tags) ? data.tags : []
       };
@@ -115,7 +115,7 @@ exports.listKnowledgeArticlesByCategory = functions
           category: data.category || '',
           slug: data.slug || '',
           featured: data.featured || false,
-          publicationDate: data.publicationDate || new Date().toISOString(),
+          publicationDate: data.publicationDate && data.publicationDate.toDate ? data.publicationDate.toDate().toISOString() : new Date().toISOString(),
           imageUrl: data.imageUrl || '',
           tags: Array.isArray(data.tags) ? data.tags : []
         });
@@ -139,7 +139,9 @@ exports.listKnowledgeCategories = functions
   .runWith(runtimeOpts)
   .https.onCall(async () => {
     try {
-      // Query Firestore for all articles to extract unique categories
+      // TODO: PERFORMANCE - This approach fetches all articles to derive categories.
+      // For larger datasets, consider maintaining a separate 'knowledgeBaseCategories' collection
+      // or using Firestore aggregation queries if suitable.
       const snapshot = await articlesCollection.get();
       
       // Extract unique categories
@@ -171,63 +173,6 @@ exports.listKnowledgeCategories = functions
 });
 
 /**
- * Get featured articles - Optimized version
- */
-exports.getFeaturedArticles = functions
-  .runWith(runtimeOpts)
-  .https.onCall(async (data = null) => {
-    // Default to 3 featured articles if data is null or limit is not specified
-    const limit = data && data.limit ? data.limit : 3;
-    
-    try {
-      // Get a reasonable number of articles (more than we need to ensure we find enough featured ones)
-      // This avoids requiring a composite index by not combining where() and orderBy()
-      const snapshot = await articlesCollection
-        .limit(50) // Get a reasonable batch size to search through
-        .get();
-      
-      // Check if any articles were found
-      if (snapshot.empty) {
-        return []; // Return an empty array if no articles found
-      }
-      
-      // Filter for featured articles and format for iOS app compatibility
-      const articles = [];
-      snapshot.forEach(doc => {
-        const data = doc.data();
-        if (data.isFeatured === true) {
-          articles.push({
-            id: doc.id,
-            title: data.title || '',
-            content: data.content || '',
-            category: data.category || '',
-            slug: data.slug || '',
-            isFeatured: true,
-            publicationDate: data.publicationDate || new Date().toISOString(),
-            imageUrl: data.imageUrl || '',
-            tags: Array.isArray(data.tags) ? data.tags : []
-          });
-        }
-      });
-      
-      // Sort by publication date (newest first) in memory
-      articles.sort((a, b) => {
-        return new Date(b.publicationDate) - new Date(a.publicationDate);
-      });
-      
-      // Apply the limit
-      return articles.slice(0, limit);
-    } catch (error) {
-      console.error('Error fetching featured articles:', error);
-      throw new functions.https.HttpsError(
-        'internal',
-        'An error occurred while fetching featured articles.',
-        error
-      );
-    }
-});
-
-/**
  * Search knowledge articles - Optimized version
  */
 exports.searchKnowledgeArticles = functions
@@ -244,7 +189,9 @@ exports.searchKnowledgeArticles = functions
     const limit = data.limit || 10; // Default to 10 results
     
     try {
-      // Get all articles
+      // TODO: PERFORMANCE - This approach fetches all articles and filters in memory.
+      // This is highly inefficient for large datasets and will not scale.
+      // For production, integrate a dedicated search service like Algolia or Typesense.
       const snapshot = await articlesCollection.get();
       
       // Filter articles that match the search query in title, content, or tags
@@ -265,7 +212,7 @@ exports.searchKnowledgeArticles = functions
             category: data.category || '',
             slug: data.slug || '',
             featured: data.featured || false,
-            publicationDate: data.publicationDate || new Date().toISOString(),
+            publicationDate: data.publicationDate && data.publicationDate.toDate ? data.publicationDate.toDate().toISOString() : new Date().toISOString(),
             imageUrl: data.imageUrl || '',
             tags: Array.isArray(data.tags) ? data.tags : []
           });
@@ -329,7 +276,7 @@ exports.getLatestArticles = functions
           slug: data.slug || '',
           featured: data.featured || false,
           isFeatured: data.isFeatured || false,
-          publicationDate: data.publicationDate || new Date().toISOString(),
+          publicationDate: data.publicationDate && data.publicationDate.toDate ? data.publicationDate.toDate().toISOString() : new Date().toISOString(),
           imageUrl: data.imageUrl || '',
           tags: Array.isArray(data.tags) ? data.tags : []
         });

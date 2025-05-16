@@ -80,7 +80,7 @@ exports.learn_getFeaturedArticlesAdapter = functions
             slug: data.slug || '',
             isFeatured: true,
             featured: true,
-            publicationDate: data.publicationDate || new Date().toISOString(),
+            publicationDate: data.publicationDate && data.publicationDate.toDate ? data.publicationDate.toDate().toISOString() : new Date().toISOString(),
             imageUrl: data.imageUrl || '',
             tags: Array.isArray(data.tags) ? data.tags : []
           });
