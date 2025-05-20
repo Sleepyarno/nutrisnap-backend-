@@ -62,7 +62,8 @@ const enhancedAnalyzeFoodImage = async (request) => {
       throw new functions.https.HttpsError('internal', 'Core image analysis handler is not available.');
     }
     const visionResults = await analyzeFoodImageHandler(request);
-    
+    const userId = request.auth ? request.auth.uid : null; // Get userId from request
+
     if (visionResults && visionResults.success) {
       // 1. Fix numeric data types (solves iOS Swift decoding errors)
       const numericFields = [
@@ -247,6 +248,22 @@ const enhancedAnalyzeFoodImage = async (request) => {
           visionResults.messages = [`${visionResults.mealName || 'Food'} analyzed successfully`];
         }
       }
+      // After all processing, save the enhanced visionResults to Firestore
+      // so getGlucoseCurve can use it.
+      // visionResults contains mealId, which was either passed in request.data.mealId or generated.
+      if (userId && visionResults.mealId) {
+        const mealDocRef = admin.firestore().collection('users').doc(userId).collection('meals').doc(visionResults.mealId);
+        try {
+          await mealDocRef.set(visionResults, { merge: true });
+          logger.info(`Successfully saved enhanced nutrition analysis for mealId: ${visionResults.mealId}, userId: ${userId} to Firestore.`);
+        } catch (dbError) {
+          logger.error(`Error saving enhanced nutrition analysis for mealId: ${visionResults.mealId}, userId: ${userId} to Firestore:`, dbError);
+          // Decide if this error should be surfaced to the client or just logged
+          // For now, we'll log it and proceed with returning visionResults
+        }
+      } else {
+        logger.warn('Could not save enhanced nutrition analysis to Firestore: userId or mealId missing.', { userId, mealId: visionResults.mealId });
+      }
     }
     
     return visionResults;
@@ -256,9 +273,12 @@ const enhancedAnalyzeFoodImage = async (request) => {
   }
 };
 
-// Export the enhanced version that fixes both issues
-// Export the enhanced analyzeFoodImage function
-exports.analyzeFoodImage = onCall({ memory: "512MiB", timeoutSeconds: 120, enforceAppCheck: true }, enhancedAnalyzeFoodImage);
+// Export FatSecret-specific API functions (Restoring these V1 style exports)
+exports.searchFatSecretNutrition = require('./src/food/fatSecretSearch').searchFatSecretNutrition;
+exports.getFatSecretFoodDetails = require('./src/food/fatSecretSearch').getFatSecretFoodDetails;
+exports.getAutocompleteSuggestions = require('./src/food/fatSecretSearch').getAutocompleteSuggestions;
+// New dedicated function for FatSecret image recognition
+exports.recognizeFoodFromImage = require('./src/food/fatSecretImageRecognition').recognizeFoodFromImage;
 
 // Export getFoodScanResult function directly from its module
 // This avoids loading the entire foodFunctions module
@@ -280,16 +300,74 @@ exports.learn_getFeaturedArticles = require('./src/learn-adapter').learn_getFeat
 exports.learn_searchKnowledgeArticles = require('./src/learn-optimized').searchKnowledgeArticles;
 exports.learn_getLatestArticles = require('./src/learn-optimized').getLatestArticles;
 
-// Export FatSecret-specific API functions
-exports.searchFatSecretNutrition = require('./src/food/fatSecretSearch').searchFatSecretNutrition;
-exports.getFatSecretFoodDetails = require('./src/food/fatSecretSearch').getFatSecretFoodDetails;
-exports.getAutocompleteSuggestions = require('./src/food/fatSecretSearch').getAutocompleteSuggestions;
-// New dedicated function for FatSecret image recognition
-exports.recognizeFoodFromImage = require('./src/food/fatSecretImageRecognition').recognizeFoodFromImage;
-
 // Main API Gateway with increased timeout and memory
 const { onRequest } = require('firebase-functions/v2/https');
 exports.app = onRequest(
-  { memory: "1GB", timeoutSeconds: 120 },  // Increased timeout for better stability
+  { memory: "1GiB", timeoutSeconds: 120 },  // Set memory to 1GiB
   appExpress
 );
+
+// Food Detection and Analysis Functions (V2 onCall)
+// Ensure analyzeFoodImage is exported correctly
+if (detectionModule && typeof enhancedAnalyzeFoodImage === 'function') { // or analyzeFoodImageHandler directly if not using enhanced wrapper
+  exports.analyzeFoodImage = onCall(
+    { timeoutSeconds: 180, memory: "1GiB", enforceAppCheck: true }, 
+    enhancedAnalyzeFoodImage 
+  );
+  logger.info('analyzeFoodImage function exported successfully (V2 onCall).');
+} else {
+  logger.error('analyzeFoodImage function (enhancedAnalyzeFoodImage or analyzeFoodImageHandler) was not exported as it was not found or not a function.');
+}
+
+// Ensure getGlucoseCurve is exported using onCall and references the function from detectionModule
+if (detectionModule && typeof detectionModule.getGlucoseCurve === 'function') {
+  // detectionModule.getGlucoseCurve is ALREADY an onCall V2 function from detection.js, export it directly.
+  exports.getGlucoseCurve = detectionModule.getGlucoseCurve;
+  logger.info('getGlucoseCurve function (pre-wrapped V2 onCall from detection.js) exported directly.');
+} else {
+  logger.error('getGlucoseCurve function was not exported because it was not found or not a function in detectionModule.');
+  if (detectionModule) {
+    logger.info('Keys in detectionModule at time of getGlucoseCurve export attempt:', Object.keys(detectionModule));
+    logger.info('Type of detectionModule.getGlucoseCurve:', typeof detectionModule.getGlucoseCurve);
+  } else {
+    logger.error('detectionModule itself is undefined at time of getGlucoseCurve export attempt.');
+  }
+}
+
+// FatSecret related functions (V2 onCall attempts - KEEP THESE COMMENTED OUT)
+/*
+if (detectionModule && typeof detectionModule.searchFatSecretNutrition === 'function') {
+  exports.searchFatSecretNutrition = onCall(
+    { timeoutSeconds: 60, memory: "256MiB" }, 
+    detectionModule.searchFatSecretNutrition
+  );
+  logger.info('searchFatSecretNutrition function exported successfully.');
+} else {
+  logger.error('searchFatSecretNutrition function was not exported because it was not found or not a function in detectionModule.');
+}
+
+if (detectionModule && typeof detectionModule.getFatSecretFoodDetails === 'function') {
+  exports.getFatSecretFoodDetails = onCall(
+    { timeoutSeconds: 60, memory: "256MiB" }, 
+    detectionModule.getFatSecretFoodDetails
+  );
+  logger.info('getFatSecretFoodDetails function exported successfully.');
+} else {
+  logger.error('getFatSecretFoodDetails function was not exported because it was not found or not a function in detectionModule.');
+}
+*/
+
+// Learn Tab Functions V2 (onCall attempt - KEEP THIS COMMENTED OUT)
+/*
+const learnFunctionsV2 = require('./src/learn_v2/index'); 
+
+if (learnFunctionsV2 && typeof learnFunctionsV2.getFeaturedArticles === 'function') {
+  exports.learnv2_getFeaturedArticles = onCall( 
+    { memory: "512MiB", timeoutSeconds: 60, enforceAppCheck: false }, 
+    learnFunctionsV2.getFeaturedArticles
+  );
+  logger.info('learnv2_getFeaturedArticles exported.');
+} else {
+  logger.error('learnv2_getFeaturedArticles could not be exported.');
+}
+*/

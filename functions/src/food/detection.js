@@ -319,7 +319,7 @@ exports.analyzeFoodImageHandler = analyzeFoodImageHandler; // Corrected export n
 // This name 'analyzeFoodImage' is what the client calls.
 // The 'enhancedAnalyzeFoodImage' in index.js wraps this.
 exports.analyzeFoodImage = onCall(
-  { enforceAppCheck: true, memory: "512MiB" }, // Ensure options are consistent
+  { timeoutSeconds: 180, memory: "1GiB", enforceAppCheck: true }, // Increased timeout and memory
   analyzeFoodImageHandler
 );
 
@@ -333,3 +333,210 @@ exports.analyzeFoodImage = onCall(
 // const [usdaNutrition, offNutrition, fatSecretNutrition] = await Promise.race([...]);
 // This block is now replaced by the single call to fatSecretAPI.recognizeFoodFromImage
 // and processing its direct output.
+
+/**
+ * Predicts blood glucose response based on meal nutritional content.
+ * This function contains the core prediction model.
+ * @param {number} carbs - Carbohydrates in grams
+ * @param {number} protein - Protein in grams
+ * @param {number} fat - Fat in grams
+ * @param {Array<number>} timePoints - Array of time points in minutes
+ * @param {number} fiber - Dietary fiber in grams (optional)
+ * @return {Array<number>} Predicted glucose values at each time point
+ */
+function predictGlucoseResponseFunction(carbs, protein, fat, timePoints, fiber = 0) {
+  // Constants for the model
+  const baselineGlucose = 85; // mg/dL - baseline glucose level
+
+  if (typeof fiber !== 'number') {
+    fiber = 0;
+  }
+
+  const carbImpact = carbs * 3.5;
+  const proteinSlowingEffect = protein * 0.3;
+  const fatSlowingEffect = fat * 0.5;
+  const fiberReduction = fiber * 0.8;
+  const fiberSlowingEffect = fiber * 0.4;
+
+  const netCarbImpact = Math.max(0, carbImpact - fiberReduction);
+  const totalImpact = netCarbImpact;
+  const slowingEffect = fatSlowingEffect + proteinSlowingEffect + fiberSlowingEffect;
+
+  const basePeakTime = 30;
+  const peakTimeModifier = slowingEffect * 0.5;
+  const adjustedPeakTime = Math.min(basePeakTime + peakTimeModifier, 60);
+
+  const peakReductionFactor = slowingEffect * 0.005;
+  const peakReduction = 1 - Math.min(peakReductionFactor, 0.5);
+  const adjustedImpact = totalImpact * peakReduction;
+  const cappedImpact = Math.min(adjustedImpact, 110);
+
+  if (cappedImpact <= 0) {
+    return timePoints.map(() => baselineGlucose);
+  }
+
+  const baseDecayRate = 0.7;
+  const decayRateModifier = slowingEffect * 0.003;
+  const adjustedDecayRate = Math.max(baseDecayRate - decayRateModifier, 0.3);
+
+  return timePoints.map(time => {
+    if (time === 0) return baselineGlucose;
+    let glucoseValue;
+    if (time < adjustedPeakTime) {
+      const riseProgress = time / adjustedPeakTime;
+      const riseCurveShape = Math.max(1.0, 1.5 - (slowingEffect * 0.01));
+      glucoseValue = baselineGlucose + (cappedImpact * Math.pow(riseProgress, riseCurveShape));
+    } else {
+      const timeSincePeak = time - adjustedPeakTime;
+      const maxTime = Math.max(...timePoints) - adjustedPeakTime;
+      const fallProgress = timeSincePeak / maxTime;
+      glucoseValue = baselineGlucose + (cappedImpact * Math.exp(-adjustedDecayRate * fallProgress));
+    }
+    return Math.max(Math.round(glucoseValue), baselineGlucose);
+  });
+}
+
+predictGlucoseResponse = predictGlucoseResponseFunction;
+
+/**
+ * Callable Firebase Function to get a predicted glucose curve.
+ * Takes mealId as input, fetches nutritional data, and then predicts.
+ */
+exports.getGlucoseCurve = onCall(
+  { enforceAppCheck: false, memory: "512MiB" }, // Temporarily set enforceAppCheck to false for debugging
+  async (request) => {
+    const { data, auth } = request;
+    // DETAILED AUTH LOGGING START
+    logger.info("--- getGlucoseCurve INVOCATION --- User Auth Object Details ---");
+    if (auth) {
+      logger.info(`getGlucoseCurve: auth object received. UID: ${auth.uid}`);
+      logger.info(`getGlucoseCurve: auth.token details: FIRINSTALLATIONID: ${auth.token.firebase?.identities?.['firebase.installation']?.[0]}, SIGNINPROVIDER: ${auth.token.firebase?.sign_in_provider}, USERID: ${auth.token.user_id}, EMAILVERIFIED: ${auth.token.email_verified}`);
+    } else {
+      logger.warn("getGlucoseCurve: auth object IS NULL or undefined upon entry.");
+    }
+    logger.info("--- END getGlucoseCurve User Auth Object Details ---");
+    // DETAILED AUTH LOGGING END
+
+    logger.info(`getGlucoseCurve called by user: ${auth ? auth.uid : 'unauthenticated'}, with data:`, data);
+
+    if (!auth) {
+      logger.warn("Unauthenticated call to getGlucoseCurve - standard check failed.");
+      throw new HttpsError(
+        'unauthenticated',
+        'The function must be called while authenticated.'
+      );
+    }
+
+    const mealId = data.mealId;
+    let nutritionDataInput = {};
+    let message = "Glucose curve prediction generated successfully.";
+
+    if (mealId) {
+      logger.info(`Fetching nutrition data for meal ID: ${mealId} for user ${auth.uid}`);
+      try {
+        const mealDocRef = admin.firestore().collection('users').doc(auth.uid).collection('meals').doc(mealId);
+        const mealDoc = await mealDocRef.get();
+
+        if (mealDoc.exists) {
+          const mealData = mealDoc.data();
+          logger.info(`Meal data found for ${mealId}:`, mealData);
+          // Ensure we are using the aggregated totals.
+          // The analyzeFoodImage logs show these are top-level properties.
+          nutritionDataInput = {
+            carbohydrates: parseFloat(mealData.carbohydrates) || 0,
+            protein: parseFloat(mealData.protein) || 0,
+            fat: parseFloat(mealData.fat) || 0,
+            fiber: parseFloat(mealData.fiber) || 0,
+          };
+          // Validate fetched data
+          if (isNaN(nutritionDataInput.carbohydrates) || isNaN(nutritionDataInput.protein) || isNaN(nutritionDataInput.fat)) {
+             logger.warn(`Incomplete nutritional data in fetched meal ${mealId}. Carbs: ${mealData.carbohydrates}, Protein: ${mealData.protein}, Fat: ${mealData.fat}. Falling back to defaults.`);
+             nutritionDataInput = { carbohydrates: 30, protein: 15, fat: 10, fiber: 2 }; // Default values
+             message = "Glucose prediction based on default values (incomplete meal data).";
+          } else {
+            message = "Glucose prediction based on meal nutritional content.";
+          }
+        } else {
+          logger.warn(`Meal document not found for mealId: ${mealId}. Using default nutritional values.`);
+          nutritionDataInput = { carbohydrates: 30, protein: 15, fat: 10, fiber: 2 }; // Default values
+          message = "Glucose prediction based on default values (meal not found).";
+        }
+      } catch (error) {
+        logger.error(`Error fetching meal ${mealId} from Firestore:`, error);
+        logger.warn(`Falling back to default nutritional values due to Firestore error for meal ${mealId}.`);
+        nutritionDataInput = { carbohydrates: 30, protein: 15, fat: 10, fiber: 2 }; // Default values
+        message = "Glucose prediction based on default values (error fetching meal).";
+      }
+    } else if (data.carbohydrates !== undefined && data.protein !== undefined && data.fat !== undefined) {
+      // Fallback to directly provided nutritional data if mealId is not present
+      logger.info("mealId not provided, using direct nutritional data from request payload.");
+      nutritionDataInput = {
+        carbohydrates: parseFloat(data.carbohydrates) || 0,
+        protein: parseFloat(data.protein) || 0,
+        fat: parseFloat(data.fat) || 0,
+        fiber: parseFloat(data.fiber) || 0,
+      };
+       if (isNaN(nutritionDataInput.carbohydrates) || isNaN(nutritionDataInput.protein) || isNaN(nutritionDataInput.fat)) {
+         logger.warn(`Invalid direct nutritional data. Carbs: ${data.carbohydrates}, Protein: ${data.protein}, Fat: ${data.fat}. Falling back to defaults.`);
+         nutritionDataInput = { carbohydrates: 30, protein: 15, fat: 10, fiber: 2 }; // Default values
+         message = "Glucose prediction based on default values (invalid direct data).";
+      } else {
+        message = "Glucose prediction based on provided nutritional content.";
+      }
+    } else {
+      logger.error('Invalid arguments for getGlucoseCurve: Missing mealId or complete macronutrient data (carbohydrates, protein, fat).', data);
+      throw new HttpsError(
+        'invalid-argument',
+        'Missing mealId or complete macronutrient data (carbohydrates, protein, fat).'
+      );
+    }
+    
+    logger.info(`Using nutritional data for prediction: Carbs: ${nutritionDataInput.carbohydrates}, Protein: ${nutritionDataInput.protein}, Fat: ${nutritionDataInput.fat}, Fiber: ${nutritionDataInput.fiber}`);
+
+    try {
+      const timePoints = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180];
+      const predictedCurveValues = predictGlucoseResponse(
+        nutritionDataInput.carbohydrates,
+        nutritionDataInput.protein,
+        nutritionDataInput.fat,
+        timePoints,
+        nutritionDataInput.fiber
+      );
+
+      const glucoseCurveDataPoints = timePoints.map((time, index) => ({
+        timeOffset: time,
+        value: predictedCurveValues[index]
+      }));
+      
+      const response = {
+        success: true,
+        curveData: glucoseCurveDataPoints,
+        nutritionData: { // Echo back the input data used for clarity
+            carbohydrates: nutritionDataInput.carbohydrates,
+            protein: nutritionDataInput.protein,
+            fat: nutritionDataInput.fat,
+            fiber: nutritionDataInput.fiber
+        },
+        message: message, // Updated message
+        timestamp: Date.now() // Add timestamp to avoid caching issues client-side
+      };
+      logger.info("Generated glucose curve for user: " + auth.uid, response);
+      return response;
+
+    } catch (error) {
+      logger.error("Error in getGlucoseCurve generation:", error);
+      throw new HttpsError(
+        'internal',
+        'Error generating glucose curve.',
+        error.message
+      );
+    }
+  }
+);
+
+module.exports = {
+    analyzeFoodImage: exports.analyzeFoodImage,
+    analyzeFoodImageHandler: analyzeFoodImageHandler,
+    getGlucoseCurve: exports.getGlucoseCurve,
+    predictGlucoseResponse: predictGlucoseResponse
+};

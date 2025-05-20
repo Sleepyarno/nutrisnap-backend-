@@ -17,7 +17,7 @@ let _tokenExpiry = 0;
 /**
  * Get an access token for the FatSecret API.
  * Implements token caching with a 60-second safety margin.
- * Requests 'basic image-recognition' scope.
+ * Requests 'image-recognition' scope.
  * @returns {Promise<string>} The access token
  */
 async function getAccessToken() {
@@ -48,7 +48,7 @@ async function getAccessToken() {
       },
       body: new URLSearchParams({
         grant_type: 'client_credentials',
-        scope: 'premier',
+        scope: 'image-recognition',
         client_id: clientId,
         client_secret: clientSecret,
       }),
@@ -273,8 +273,8 @@ async function recognizeFoodFromImage(base64ImageString, region = 'US', language
   }
 
   try {
-    const accessToken = await getAccessToken(); // Ensures 'basic image-recognition' scope is requested
-    const FATSECRET_IMAGE_API_URL = 'https://platform.fatsecret.com/rest/image-recognition/v1'; // Specific endpoint from original
+    const accessToken = await getAccessToken(); // Ensures 'image-recognition' scope is requested
+    const FATSECRET_IMAGE_API_URL = 'https://platform.fatsecret.com/rest/image-recognition/v1';
 
     logger.info(`Calling FatSecret image recognition API for region: ${region}, language: ${language}...`);
     const response = await fetch(FATSECRET_IMAGE_API_URL, {
